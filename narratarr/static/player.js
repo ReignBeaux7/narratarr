@@ -5,7 +5,7 @@
 // presents a single timeline: each file has an offset, and "time" is always
 // seconds from the start of the book.
 
-import { $, $$, esc, I, api, coverHTML, fmtTime, fmtLeft, toast } from "./util.js";
+import { $, $$, esc, I, api, coverHTML, fmtTime, fmtLeft, libraryCover, toast } from "./util.js";
 
 const SPEEDS = [0.75, 0.9, 1, 1.1, 1.2, 1.3, 1.5, 1.75, 2, 2.5, 3];
 const SLEEP = [[0, "Off"], [5, "5 minutes"], [15, "15 minutes"], [30, "30 minutes"], [45, "45 minutes"], [60, "1 hour"], [-1, "End of chapter"]];
@@ -447,7 +447,7 @@ class Player {
         </aside>` : ""}
       </div>`;
     const bg = $(".np-bg div", np);
-    bg.style.backgroundImage = `url(${JSON.stringify(`/api/library/${b.id}/cover`)})`;
+    bg.style.backgroundImage = `url(${JSON.stringify(libraryCover(b.id))})`;
     requestAnimationFrame(() => np.classList.add("open"));
     document.body.style.overflow = "hidden";
     this.lastChapter = null;
