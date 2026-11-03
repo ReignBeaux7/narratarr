@@ -1,0 +1,58 @@
+# Keeps this fork on the newest official Narratarr release, with the phone fix on top.
+#
+# Every 6 hours: if narratarr/narratarr has published a newer release tag (v1.2.3), merge it
+# into main and build a fresh Docker image (ghcr.io/<you>/narratarr:latest).
+# The fix lives in its own files, so releases merge in cleanly. If one ever can't merge,
+# this run fails, GitHub emails you, and main is left exactly as it was.
+# Run it by hand any time: Actions tab -> "Sync with upstream releases" -> Run workflow.
+
+name: Sync with upstream releases
+
+on:
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency: sync-upstream
+
+jobs:
+  sync:
+    if: github.repository != 'narratarr/narratarr'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge the newest upstream release
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/narratarr/narratarr.git
+          git fetch --quiet --no-tags upstream "+refs/tags/v*:refs/tags/upstream/v*"
+          latest=$(git tag -l 'upstream/v*' --sort=-v:refname | head -n 1)
+          if [ -z "$latest" ]; then echo "No upstream releases found."; exit 0; fi
+          echo "Newest upstream release: ${latest#upstream/}"
+          if git merge-base --is-ancestor "$latest" HEAD; then
+            echo "Already up to date."
+            exit 0
+          fi
+          if ! git merge --no-edit -m "Merge Narratarr ${latest#upstream/} from upstream" "$latest"; then
+            git merge --abort
+            echo "::error::Narratarr ${latest#upstream/} conflicts with the phone fix. Nothing was changed."
+            exit 1
+          fi
+          git push origin HEAD:main
+          echo "updated=${latest#upstream/}" >> "$GITHUB_OUTPUT"
+
+      # A push made by this workflow doesn't start other workflows on its own, so ask for the image.
+      - name: Build the new image
+        if: steps.merge.outputs.updated != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docker.yml --ref main

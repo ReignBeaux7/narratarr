@@ -60,15 +60,10 @@ export function hue(str) {
   return h % 360;
 }
 
-// Phones and tablets get small covers: full-size art on a big Library page makes iOS Safari
-// run out of memory and close the tab. Desktops keep the full-size image.
-export const TOUCH = typeof matchMedia === "function" && matchMedia("(hover: none)").matches;
-export const libraryCover = (id) => `/api/library/${id}/cover${TOUCH ? "?w=480" : ""}`;
-
 export function coverHTML(b, cls = "") {
   const h = hue(b.title + b.author);
   // Downloaded books use the cover saved next to the audio; everything else uses the source's image.
-  const src = b.id && b.path ? libraryCover(b.id) : b.cover_url || "";
+  const src = b.id && b.path ? `/api/library/${b.id}/cover` : b.cover_url || "";
   // Book covers are taller than audiobook squares: show the whole cover, standing on a blur of itself.
   const book = b.kind === "ebook" || b.source === "openlibrary";
   const tag = (extra) => `<img ${extra} src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onload="this.classList.add('loaded')" onerror="this.remove()">`;

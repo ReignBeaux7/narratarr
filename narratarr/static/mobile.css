@@ -1,0 +1,10 @@
+/* The phone fix (see narratarr/mobilefix.py). Linked with media="(hover: none)", so it only
+   applies on touch screens; desktops never load these rules.
+
+   A Library page with a blur layer on every card is heavy for mobile Safari. Same look,
+   minus the expensive effects; offscreen cards aren't drawn until you scroll to them. */
+.card { animation: none; content-visibility: auto; contain-intrinsic-size: auto 260px; }
+.card .cover-wrap::after { display: none; }
+.status-tag, .kind-tag, .finished-tag, .listen-bar, .st-badge { backdrop-filter: none; }
+.cover.book img.blur { display: none; }
+.cover.book img { filter: none; }

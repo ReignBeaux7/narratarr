@@ -27,7 +27,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from . import (apiv1, audible, audiobookshelf, auth, brave, config, db, downloaders, ebooks, importer, media, search,
-               thumbs, tokens, updates, users, wanted)
+               tokens, updates, users, wanted)
 from .audiobookshelf import Audiobookshelf, AudiobookshelfError
 from .downloaders import ClientError
 from . import alldebrid, languages, notify
@@ -652,31 +652,23 @@ async def stream(book_id: int, index: int):
 
 
 @app.get("/api/library/{book_id}/cover")
-async def cover(book_id: int, w: int = 0):
+async def cover(book_id: int):
     book = _get_or_404(book_id)
     path = Path(book["path"]) if book["path"] else None
     # Only plain images, never SVG or anything else that could run script on Narratarr's own address.
     safe = {"headers": {"X-Content-Type-Options": "nosniff"}}
     cached = {"headers": {"X-Content-Type-Options": "nosniff", "Cache-Control": "max-age=86400"}}
-
-    async def small(data: bytes) -> Response | None:
-        """With ?w= (phones ask for it), a shrunken copy instead of multi-megapixel art."""
-        thumb = await asyncio.to_thread(thumbs.thumbnail, data, w) if w > 0 else None
-        return Response(thumb, media_type="image/jpeg", **cached) if thumb else None
-
     folder = path.parent if path and path.is_file() and wanted.kind_of(book) == "ebook" else path
     if folder and folder.is_dir():
         for found in sorted(folder.glob("cover.*")):
             if found.suffix.lower() in COVER_TYPES:
-                if w > 0 and (resp := await small(await asyncio.to_thread(found.read_bytes))):
-                    return resp
                 return FileResponse(found, media_type=COVER_TYPES[found.suffix.lower()], **safe)
         if folder == path:
             art = await asyncio.to_thread(importer.embedded_cover, path)
         else:
             art = await asyncio.to_thread(ebooks.epub_cover, path) if path.suffix.lower() == ".epub" else None
         if art and art[1] in COVER_TYPES.values():
-            return await small(art[0]) or Response(art[0], media_type=art[1], **cached)
+            return Response(art[0], media_type=art[1], **cached)
     if book["cover_url"].startswith(("http://", "https://")):
         return RedirectResponse(book["cover_url"])
     raise HTTPException(404, "No cover")

@@ -6,11 +6,11 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 WORKDIR /app
 # Dependencies first, so code changes don't reinstall them.
 COPY pyproject.toml uv.lock README.md CHANGELOG.md ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project
 COPY narratarr ./narratarr
-RUN uv sync --frozen --no-dev --no-editable
-# Pillow makes small covers for phones (narratarr/thumbs.py). Without it, full-size covers are sent.
-RUN uv pip install --python /app/.venv/bin/python "pillow==12.3.0"
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-editable
+# Phone fix: Pillow makes small covers (narratarr/thumbs.py, narratarr/mobilefix.py).
+RUN --mount=type=cache,target=/root/.cache/uv uv pip install --python /app/.venv/bin/python "pillow==12.3.0"
 
 FROM python:3.13-slim
 LABEL org.opencontainers.image.title="Narratarr" \
@@ -32,4 +32,5 @@ EXPOSE 8484
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"NARRATARR_PORT\"]}/api/health', timeout=4)"
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["narratarr"]
+# Phone fix: start through narratarr/mobilefix.py, which then runs Narratarr as normal.
+CMD ["python", "-m", "narratarr.mobilefix"]
