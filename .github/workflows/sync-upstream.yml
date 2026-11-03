@@ -47,6 +47,19 @@ jobs:
             echo "::error::Narratarr ${latest#upstream/} conflicts with the phone fix. Nothing was changed."
             exit 1
           fi
+          # Note the merge in FORK-CHANGELOG.md (only this fork has that file, so it never conflicts).
+          if [ -f FORK-CHANGELOG.md ]; then
+            python3 - "${latest#upstream/}" <<'PY'
+          import sys, datetime, pathlib
+          p = pathlib.Path("FORK-CHANGELOG.md"); s = p.read_text()
+          mark = "<!-- sync-upstream adds a line below for every release it merges -->"
+          line = f"- {datetime.date.today():%Y-%m-%d}: merged Narratarr **{sys.argv[1]}**"
+          if mark in s and f"**{sys.argv[1]}**" not in s:
+              p.write_text(s.replace(mark, mark + "\n" + line, 1))
+          PY
+            git add FORK-CHANGELOG.md
+            git diff --cached --quiet || git commit -m "Fork changelog: merged Narratarr ${latest#upstream/}"
+          fi
           git push origin HEAD:main
           echo "updated=${latest#upstream/}" >> "$GITHUB_OUTPUT"
 
