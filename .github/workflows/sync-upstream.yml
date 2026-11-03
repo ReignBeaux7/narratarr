@@ -1,7 +1,8 @@
 # Keeps this fork on the newest official Narratarr release, with the phone fix on top.
 #
 # Every 6 hours: if narratarr/narratarr has published a newer release tag (v1.2.3), merge it
-# into main and build a fresh Docker image (ghcr.io/<you>/narratarr:latest).
+# into main, build a fresh Docker image (ghcr.io/<you>/narratarr:latest), and publish a
+# release on this fork with Narratarr's notes plus what the fork adds.
 # The fix lives in its own files, so releases merge in cleanly. If one ever can't merge,
 # this run fails, GitHub emails you, and main is left exactly as it was.
 # Run it by hand any time: Actions tab -> "Sync with upstream releases" -> Run workflow.
@@ -69,3 +70,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run docker.yml --ref main --repo "${{ github.repository }}"
+
+      - name: Publish a release with the notes
+        if: steps.merge.outputs.updated != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.merge.outputs.updated }}
+        run: |
+          python3 .github/fork-release-notes.py "$VERSION" > release-notes.md
+          gh release create "fork-$VERSION" --repo "${{ github.repository }}" --target "$(git rev-parse HEAD)" \
+            --title "Narratarr ${VERSION#v} + phone fix" --notes-file release-notes.md --latest

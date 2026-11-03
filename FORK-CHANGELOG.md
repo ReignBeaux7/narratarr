@@ -1,8 +1,9 @@
 # Fork changelog
 
-Changes in this fork on top of [Narratarr](https://github.com/narratarr/narratarr). For Narratarr's
-own release notes, see [CHANGELOG.md](CHANGELOG.md) (also in the app under Settings → Updates →
-What's new).
+Changes in this fork on top of [Narratarr](https://github.com/narratarr/narratarr). For easy-to-read
+notes on each version (Narratarr's changes plus this fork's), see the
+[Releases](https://github.com/ReignBeaux7/narratarr/releases) page. Narratarr's full history is in
+[CHANGELOG.md](CHANGELOG.md) (also in the app under Settings → Updates → What's new).
 
 The fork's changes live in their own files, so new Narratarr releases merge in without conflicts:
 `narratarr/mobilefix.py`, `narratarr/thumbs.py`, `narratarr/static/mobile.css`,
@@ -30,6 +31,7 @@ Every 6 hours the fork checks for a new official Narratarr release, merges it, a
 - Reworked the earlier fix into add-on files and put Narratarr's own files back to the release
   versions, so syncs don't conflict.
 - Fixed the sync's build step starting on the wrong repository.
+- Each synced version now gets a **release** on GitHub with its notes, plus this changelog.
 
 ### 2026-11-02 (first version)
 - Forked from Narratarr **0.8.7**. First phone fix: small covers on the Library page and lighter
