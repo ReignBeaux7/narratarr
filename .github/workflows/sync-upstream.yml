@@ -39,6 +39,7 @@ jobs:
           latest=$(git tag -l 'upstream/v*' --sort=-v:refname | head -n 1)
           if [ -z "$latest" ]; then echo "No upstream releases found."; exit 0; fi
           echo "Newest upstream release: ${latest#upstream/}"
+          echo "latest=${latest#upstream/}" >> "$GITHUB_OUTPUT"
           if git merge-base --is-ancestor "$latest" HEAD; then
             echo "Already up to date."
             exit 0
@@ -71,12 +72,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run docker.yml --ref main --repo "${{ github.repository }}"
 
+      # Also catches up: any synced version without a release (say, the first one) gets one.
       - name: Publish a release with the notes
-        if: steps.merge.outputs.updated != ''
+        if: steps.merge.outputs.latest != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.merge.outputs.updated }}
+          VERSION: ${{ steps.merge.outputs.latest }}
         run: |
+          if gh release view "fork-$VERSION" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release fork-$VERSION already exists."; exit 0
+          fi
           python3 .github/fork-release-notes.py "$VERSION" > release-notes.md
           gh release create "fork-$VERSION" --repo "${{ github.repository }}" --target "$(git rev-parse HEAD)" \
             --title "Narratarr ${VERSION#v} + phone fix" --notes-file release-notes.md --latest
