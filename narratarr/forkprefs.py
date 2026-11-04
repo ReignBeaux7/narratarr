@@ -90,13 +90,14 @@ def rank_key(item: dict, s: dict, wanted_words: list[str]) -> tuple:
     seeders = item.get("seeders")
     alive = seeders is None or seeders > 0
     good = item.get("match", 0) >= wanted.AUTO_MATCH
-    head = (bool(item.get("usable")), bool(item.get("language_ok", True)), good,
+    # A release nobody is seeding can't download, so it never outranks one that can.
+    head = (bool(item.get("usable")), bool(item.get("language_ok", True)), good, alive,
             preferred(item, wanted_words) if good else False)
     if s["prefer_seeders"]:
-        return (*head, alive, seeders if seeders is not None else 50, item.get("match", 0))
+        return (*head, seeders if seeders is not None else 50, item.get("match", 0))
     free = item.get("source") in ("librivox", "oldtimeradio")
     m4b = (item.get("format") or "").upper() in ("M4B", "EPUB")
-    return (*head, item.get("match", 0) >= 95, alive, free, m4b, seeders if seeders is not None else 50)
+    return (*head, item.get("match", 0) >= 95, free, m4b, seeders if seeders is not None else 50)
 
 
 def rerank(found: list[dict], s: dict | None = None) -> list[dict]:
