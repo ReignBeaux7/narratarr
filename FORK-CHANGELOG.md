@@ -6,9 +6,9 @@ notes on each version (Narratarr's changes plus this fork's), see the
 [CHANGELOG.md](CHANGELOG.md) (also in the app under Settings → Updates → What's new).
 
 The fork's changes live in their own files, so new Narratarr releases merge in without conflicts:
-`narratarr/mobilefix.py`, `narratarr/thumbs.py`, `narratarr/static/mobile.css`,
-`narratarr/static/smooth.js`, `.github/workflows/sync-upstream.yml`, two lines in the `Dockerfile`,
-and their tests.
+`narratarr/mobilefix.py`, `narratarr/forkprefs.py`, `narratarr/thumbs.py`,
+`narratarr/static/mobile.css`, `narratarr/static/smooth.js`, `narratarr/static/forkui.js`,
+`.github/workflows/sync-upstream.yml`, two lines in the `Dockerfile`, and their tests.
 
 ## Automatic updates
 
@@ -19,6 +19,17 @@ Every 6 hours the fork checks for a new official Narratarr release, merges it, a
 - 2026-11-02: merged Narratarr **v0.8.8** (tidy library)
 
 ## Fork changes
+
+### 2026-11-03
+- **Release picking** (Settings → Search & sources → Release picking):
+  - **Most seeders wins:** among releases that clearly match a Wanted book, the one with the most
+    seeders is grabbed.
+  - **Preferred versions:** releases with words you choose (GraphicAudio by default) win
+    whenever one matches.
+  - **Grab every part:** when a release is one part of several ("Part 1 of 3"), the other parts
+    are grabbed too, each as its own book.
+- **Covers for indexer results:** Prowlarr/Torznab search results now show cover art, looked up
+  in Apple's audiobook catalog when the picture is shown.
 
 ### 2026-11-02
 - **No more page flashing.** Narratarr re-reads the library every 2 seconds and used to redraw

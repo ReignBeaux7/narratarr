@@ -13,6 +13,11 @@ around the normal app and then runs it exactly as `narratarr` would:
 3. Smooth refreshes, on every device: the page also loads static/smooth.js, which stops
    the 2-second library refresh from redrawing whole lists (the page flash and covers
    fading in again). Unchanged cards stay put; only changed ones are swapped.
+4. Covers for indexer results: Prowlarr/Torznab results rarely carry artwork, so Discover
+   gives them a cover link (/api/fork/indexer-cover) that looks the book up in Apple's
+   audiobook catalog when the picture is actually shown.
+5. Release picking (forkprefs.py, settings in static/forkui.js): most seeders wins,
+   preferred versions such as GraphicAudio, and grabbing every part of multi-part releases.
 
 If anything here fails, Narratarr runs as normal without it.
 """
@@ -20,8 +25,10 @@ If anything here fails, Narratarr runs as normal without it.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+from urllib.parse import quote
 
 from . import thumbs
 
@@ -31,7 +38,8 @@ PHONE_WIDTH = 480
 COVER_PATH = re.compile(r"/api/library/\d+/cover")
 PHONE_UA = re.compile(r"iPhone|iPod|Android.*Mobile|Mobile Safari|CriOS|FxiOS|EdgiOS", re.I)
 STYLESHEET = b'<link rel="stylesheet" href="/static/mobile.css" media="(hover: none)" />'
-SCRIPT = b'<script src="/static/smooth.js"></script>'
+SCRIPT = b'<script src="/static/smooth.js"></script>\n<script src="/static/forkui.js" defer></script>'
+INDEXERS = ("prowlarr", "torznab")
 
 
 def is_phone(user_agent: str) -> bool:
@@ -53,13 +61,76 @@ def _headers(response, drop: tuple[str, ...]) -> dict[str, str]:
     return {k: v for k, v in response.headers.items() if k.lower() not in drop}
 
 
+def add_indexer_covers(data: dict) -> dict:
+    """Give indexer results without artwork a cover link that is looked up when it's shown."""
+    for item in data.get("items") or []:
+        if isinstance(item, dict) and item.get("source") in INDEXERS and not item.get("cover_url"):
+            name = (item.get("release") or item.get("title") or "").strip()
+            if name:
+                item["cover_url"] = "/api/fork/indexer-cover?q=" + quote(name[:300])
+    return data
+
+
+async def indexer_cover_url(q: str) -> str:
+    """Artwork for a release name from Apple's audiobook catalog, or ''."""
+    from rapidfuzz import fuzz
+
+    from . import search
+
+    q = (q or "").strip()[:300]
+    if not q:
+        return ""
+    match = await search.identify(q)
+    if not match and config_smart_search():
+        words = search.normalize(search._RELEASE_NOISE.sub(" ", search.clean_title(q)))
+        if len(words) >= 3:
+            for sg in await search.suggestions(words, limit=3):
+                title = search.normalize(sg.get("title", "").split(":")[0])
+                if title and fuzz.partial_ratio(title, words) >= 90:
+                    match = sg
+                    break
+    url = (match or {}).get("cover_url") or ""
+    return url if url.startswith("https://") else ""
+
+
+def config_smart_search() -> bool:
+    from . import config
+
+    return bool(config.load().smart_search)  # same switch Narratarr uses before sending names to Apple
+
+
 def install(app) -> None:
-    """Add the two layers to a Starlette/FastAPI app (before it starts serving)."""
+    """Add the layers to a Starlette/FastAPI app (before it starts serving)."""
     from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import Response
+    from starlette.responses import RedirectResponse, Response
+
+    async def indexer_cover(q: str = ""):
+        url = await indexer_cover_url(q)
+        if url:
+            return RedirectResponse(url, headers={"Cache-Control": "max-age=86400"})
+        return Response(status_code=404, headers={"Cache-Control": "max-age=3600"})
+
+    if hasattr(app, "add_api_route"):
+        app.add_api_route("/api/fork/indexer-cover", indexer_cover, methods=["GET"], include_in_schema=False)
+        try:
+            from . import forkprefs
+            forkprefs.install(app)
+        except Exception:  # noqa: BLE001 - the rest of the fix still works without it
+            log.exception("Release picking couldn't be added")
 
     async def mobile_fix(request, call_next):
         path = request.url.path
+        if request.method == "GET" and path == "/api/discover":
+            response = await call_next(request)
+            if response.status_code != 200 or not response.headers.get("content-type", "").startswith("application/json"):
+                return response
+            body = await _body(response)
+            try:
+                body = json.dumps(add_indexer_covers(json.loads(body))).encode()
+            except (ValueError, TypeError, AttributeError):
+                pass
+            return Response(body, status_code=200, media_type="application/json",
+                            headers=_headers(response, ("content-length", "content-type", "etag")))
         if request.method != "GET" or not (path == "/" or COVER_PATH.fullmatch(path)):
             return await call_next(request)
         phone = is_phone(request.headers.get("user-agent", ""))

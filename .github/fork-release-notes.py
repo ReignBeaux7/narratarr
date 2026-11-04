@@ -23,6 +23,8 @@ Everything above, plus:
 
 - **No page flashing.** Background refreshes keep the cards and covers that didn't change, instead of redrawing the whole page.
 - **Phone-friendly Library.** Phones get small cover images, and touch screens skip the heavy blur effects, so big libraries don't crash mobile Safari.
+- **Smarter release picking.** Most seeders wins, preferred versions such as GraphicAudio come first, and every part of a multi-part release is grabbed (Settings → Search & sources → Release picking).
+- **Covers for indexer results.** Prowlarr and Torznab search results show cover art.
 - **Automatic updates.** New official Narratarr releases are merged in and built automatically.
 
 Full history of the fork's changes: [FORK-CHANGELOG.md](https://github.com/{repo}/blob/main/FORK-CHANGELOG.md)
