@@ -26,8 +26,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from . import (apiv1, audible, audiobookshelf, auth, brave, config, db, downloaders, ebooks, importer, media, search,
-               tokens, updates, users, wanted)
+from . import (apiv1, audible, audiobookshelf, auth, brave, config, db, downloaders, ebooks, importer, media, ratings,
+               routing, search, tokens, updates, users, wanted)
 from .audiobookshelf import Audiobookshelf, AudiobookshelfError
 from .downloaders import ClientError
 from . import alldebrid, languages, notify, tidy
@@ -43,6 +43,8 @@ log = logging.getLogger("narratarr.api")
 
 
 STATIC = Path(__file__).parent / "static"
+# A book Audnex serves from `uk` (Project Hail Mary). Its rating anchors the region Test button.
+PROBE_ASIN = "B08GB2RLKM"
 COVER_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}
 
 
@@ -55,6 +57,8 @@ async def lifespan(app: FastAPI):
     app.state.worker = worker
     app.state.tasks = set()
     worker.start()
+    if config.load().ratings_enabled:
+        ratings.start_filler()  # nothing is ever queued with the feature off
     yield
     await worker.stop()
 
@@ -216,13 +220,38 @@ async def sources():
 
 @app.get("/api/discover")
 async def discover(q: str = "", category: str = "", page: int = 1, source: str = "librivox",
-                   kind: Literal["audiobook", "ebook"] = "audiobook"):
+                   kind: Literal["audiobook", "ebook"] = "audiobook", sort: str = "", region: str = ""):
     try:
         src = get_source(source)
     except ValueError:
         raise HTTPException(400, "Unknown source.")
     if src.name == "prowlarr" and kind == "ebook":
         src = ebook_indexers()  # the same indexers, searched in their ebook categories
+    # The Audible catalog can be searched in another store an admin turned on, for this search only.
+    stores = audible.regions() if src.name == "audible" else []
+    region = region.strip().lower()
+    if region and src.name == "audible" and region not in stores:
+        raise HTTPException(400, "That Audible store isn't one you can search here. "
+                                 "An admin can add it under Settings → Search & sources.")
+    if src.name == "audible":
+        with audible.using(region):
+            data = await _discover_fetch(src, q, category, page, kind)
+        data["region"] = region or stores[0]
+        if q.strip() and not region and not data["items"]:
+            # Nothing in the main store: try the others, in the order the admin listed them.
+            for other in stores[1:]:
+                with audible.using(other):
+                    found = await _discover_fetch(src, q, category, page, kind)
+                if found["items"]:
+                    data = {**found, "region": other, "region_note":
+                            f"Nothing in the {audible.NAMES[stores[0]]} store, so these are from {audible.NAMES[other]}."}
+                    break
+    else:
+        data = await _discover_fetch(src, q, category, page, kind)
+    return await _discover_finish(data, src, kind, sort)
+
+
+async def _discover_fetch(src, q: str, category: str, page: int, kind: str) -> dict:
     settings = config.load()
     use_brave = src.name == "audiobookbay" and settings.search_provider == "brave" and settings.brave_api_key
     try:
@@ -246,17 +275,46 @@ async def discover(q: str = "", category: str = "", page: int = 1, source: str =
         raise _source_error(e, src.label)
     except brave.BraveError as e:
         raise HTTPException(502, str(e))
+    return data
+
+
+async def _discover_finish(data: dict, src, kind: str, sort: str) -> dict:
     books = db.list_books()
     owned = {b["release_url"]: b for b in books if b["release_url"]} | {b["source_url"]: b for b in books}
     want = languages.parse(config.load().languages)
+    # Which client would take each result, resolved once per request. The chip is a hint, not a
+    # promise: the grab re-resolves, because a rule can change between showing a row and clicking it.
+    settings = config.load()
+    client_by_id = {e.id: e for e in downloaders.entries(settings)}
+    shelf = wanted.owned_index(await audiobookshelf.owned(settings)) if src.name in CATALOGS else (set(), {})
     for item in data["items"]:
         b, e = owned.get(item["url"]), owned.get(wanted.url_for(item["url"], "ebook"))
+        item["abs"] = bool(shelf[0] or shelf[1]) and not (b or e) and wanted.in_owned(item, shelf)
         item["source"] = src.name
         # Indexers rarely say what language a release is in; its name often does ("[German]", "Hörbuch").
         item["language"] = languages.name(item.get("language")) or (
             languages.detect(item.get("title") or "") if src.name in ("prowlarr", "torznab", "audiobookbay") else "")
         item["lang_ok"] = languages.allowed(item["language"], want)
         item["library"] = {"id": (b or e)["id"], "status": (b or e)["status"]} if b or e else None
+        item["client"] = None
+        if src.delivery != "direct":  # a direct source needs no client, so the row has no chip
+            # A source that does not report an indexer per row (AudiobookBay) is routed by its own
+            # name, which is what the indexer picker offers and what coverage() reports on.
+            decision = routing.resolve(settings, item.get("indexer") or src.label, kind,
+                                       item.get("protocol") or ("usenet" if item.get("nzb_url") else "torrent"))
+            entry = client_by_id.get(decision.client_id)
+            if decision.client_id:
+                item["client"] = {"id": decision.client_id, "label": entry.label if entry else "",
+                                  "rule": decision.rule}
+    # Ratings: read from the cache only. Anything missing is filled in the background and shows
+    # up on the next search, so a slow ratings provider never holds up a page.
+    _provider = ratings.provider()
+    if _provider is not None:
+        ratings.ensure_filler()  # switched on since startup: the filler wasn't started then
+    for item in data["items"]:
+        ratings.enrich(item, provider_obj=_provider)
+    if sort == "rating":
+        data["items"] = ratings.sort_items(data["items"])
     if src.name == "prowlarr" and kind == "ebook" and not data["items"]:
         data["note"] = await _no_ebook_indexers(src)
     return data
@@ -315,6 +373,30 @@ async def library():
         b["companion_id"] = pairs[b["id"]]["id"] if b["id"] in pairs else None  # the same book in its other format
         b["requested_by_name"] = names.get(b.get("requested_by"), "")
     return books
+
+
+@app.get("/api/library/ratings")
+async def library_ratings():
+    """The rating pill for each library book that has one, from the cache only (PR #14, curator8888).
+
+    Its own request rather than part of /api/library, which the page asks for every two seconds: the
+    Library asks for this once per visit. Only books with an ASIN are queued for the background
+    filler, so a large library of imported books never turns into a search per book."""
+    p = ratings.provider()
+    if p is None:
+        return {"off": True, "ratings": {}}
+    ratings.ensure_filler()
+
+    def collect() -> dict:
+        out = {}
+        for b in db.list_books():
+            item = ratings.enrich({"title": b["title"], "author": b["author"], "asin": b.get("asin") or "",
+                                   "source": b["source"]}, provider_obj=p, fill=bool(b.get("asin")))
+            if item["rating"]:
+                out[b["id"]] = item["rating"]
+        return out
+
+    return {"off": False, "ratings": await asyncio.to_thread(collect)}
 
 
 @app.get("/api/stats")
@@ -398,7 +480,7 @@ async def _catalog_book(url: str, source: str) -> dict:
     """A catalog book's details, in the shape wanted.add_wanted takes."""
     if source == "audible":
         try:
-            b = await audible.book(audible.asin_from_url(url))
+            b = await audible.book(audible.asin_from_url(url), r=audible.region_from_url(url) or None)
         except audible.AudibleError as e:
             raise HTTPException(502, str(e))
         if not b:
@@ -443,7 +525,7 @@ def _background(coro) -> None:
 
 async def _search_in_background(book_id: int) -> None:
     try:
-        if await wanted.search_and_grab(db.get(book_id)):
+        if await wanted.search_and_grab(db.get(book_id), hold=config.load().found_needs_approval):
             _worker().poke()
     except Exception as e:
         db.update(book_id, search_note=readable_error(e))
@@ -483,14 +565,13 @@ async def _drop_from_client(book: dict) -> None:
     """Stopping a download in Narratarr stops it in SABnzbd, NZBGet, qBittorrent, Transmission or Deluge too."""
     if not book["client_job_id"] or book["status"] not in db.ACTIVE:
         return
-    s = config.load()
-    name = book["download_client"]
+    entry = downloaders.entry_for_job(config.load(), book["download_client"])
     try:
-        if name in downloaders.USENET_CLIENTS:
-            async with downloaders.usenet_client(s, name=name) as client:
+        if entry and entry.delivery == "usenet":
+            async with downloaders.client_for(entry) as client:
                 await client.delete(book["client_job_id"])
-        elif name in ("qbittorrent", "transmission", "deluge"):
-            async with downloaders.torrent_client(s, name=name) as client:
+        elif entry and entry.type in ("qbittorrent", "transmission", "deluge"):
+            async with downloaders.client_for(entry) as client:
                 await client.delete(book["client_job_id"], files=True, tag=f"narratarr-{book['id']}")
     except ClientError:
         pass
@@ -510,6 +591,9 @@ class BookEdit(BaseModel):
     title: str | None = None
     author: str | None = None
     narrators: list[str] | None = None
+    series: str | None = None  # empty: not in a series
+    series_number: str | None = None
+    year: str | None = None
 
 
 def _tidy(text: str, limit: int) -> str:
@@ -519,7 +603,7 @@ def _tidy(text: str, limit: int) -> str:
 @app.patch("/api/library/{book_id}")
 async def edit_book(book_id: int, body: BookEdit):
     """Correct what Narratarr shows for a book. Its files and folder stay as they are."""
-    _get_or_404(book_id)
+    book = _get_or_404(book_id)
     changes: dict = {}
     if body.title is not None:
         changes["title"] = _tidy(body.title, 300)
@@ -529,9 +613,41 @@ async def edit_book(book_id: int, body: BookEdit):
         changes["author"] = _tidy(body.author, 300)
     if body.narrators is not None:
         changes["narrators"] = [n for n in (_tidy(x, 120) for x in body.narrators[:8]) if n]
+    if body.series is not None or body.series_number is not None:
+        old = (book.get("series") or [{}])[0] if book.get("series") else {}
+        name = _tidy(body.series if body.series is not None else old.get("title", ""), 200)
+        number = _tidy(body.series_number if body.series_number is not None else old.get("sequence", ""), 12)
+        if number and not re.fullmatch(r"\d+(\.\d+)?", number):
+            raise HTTPException(400, "The book's number in its series should be a number, like 3 or 2.5.")
+        # The series keeps Audible's ID while its name is unchanged, so following it still works.
+        changes["series"] = [{"asin": old.get("asin", "") if name == old.get("title") else "", "title": name,
+                              "sequence": number}] if name else []
+    if body.year is not None:
+        year = body.year.strip()
+        if year and not re.fullmatch(r"\d{4}", year):
+            raise HTTPException(400, "The year should be four digits, like 1965.")
+        released = book.get("released") or ""
+        changes["released"] = (released if released[:4] == year else year) if year else ""
     if changes:
         db.update(book_id, **changes)
     return db.get(book_id)
+
+
+@app.get("/api/library/{book_id}/audible-match")
+async def audible_match(book_id: int):
+    """What Audible has for this book, to fill the Edit details form with. Saves nothing."""
+    book = _get_or_404(book_id)
+    try:
+        b = await wanted.audible_match(book)
+    except audible.AudibleError as e:
+        raise HTTPException(502, str(e))
+    if not b:
+        raise HTTPException(404, "Audible doesn't have a book with exactly this title and author. "
+                                 "Check them, or fill in the details yourself.")
+    series = (b.get("series") or [{}])[0] if b.get("series") else {}
+    return {"asin": b["asin"], "title": b["title"], "author": b["author"], "narrators": b["narrators"],
+            "series": audible.series_name(series.get("title", "")), "series_number": series.get("sequence", ""),
+            "year": (b.get("released") or "")[:4], "series_first": b.get("series_first", "")}
 
 
 @app.delete("/api/library/{book_id}")
@@ -599,7 +715,9 @@ def _clear_tmp(book: dict, settings: config.Settings) -> str:
     copy sitting in there. Those go back where they came from, or to a "recovered" folder.
     """
     tmp = tmp_dir(book, settings)
-    came_from_elsewhere = book["import_mode"] == "move" or book["download_client"] in downloaders.USENET_CLIENTS
+    job = downloaders.entry_for_job(settings, book["download_client"])
+    usenet = book["download_client"] in downloaders.USENET_CLIENTS or (job is not None and job.delivery == "usenet")
+    came_from_elsewhere = book["import_mode"] == "move" or usenet
     if not (has_files(tmp) and came_from_elsewhere):
         shutil.rmtree(tmp, ignore_errors=True)
         return ""
@@ -775,6 +893,10 @@ async def releases(book_id: int):
     except ProwlarrError as e:
         raise HTTPException(502, str(e))
     db.update(book_id, last_searched=time.time())
+    turned_down = set(book.get("skipped_releases") or [])
+    for item in found:  # so nobody picks a release that already failed for this book without knowing
+        item["failed"] = wanted.failed_release(book, item) or ""
+        item["turned_down"] = item["url"] in turned_down
     return {"items": found[:60], "auto_match": wanted.AUTO_MATCH}
 
 
@@ -817,10 +939,25 @@ async def approve(book_id: int):
         db.update(book_id, status="wanted", error="", search_note="")
         _background(_search_in_background(book_id))
     else:
-        db.update(book_id, status="queued", error="", progress=0, detail="")
+        db.update(book_id, status="queued", error="", progress=0, detail="", found_by_search=0)
         _worker().poke()
     log.info("Approved %s (book %s)", book["title"], book_id)
     return db.get(book_id)
+
+
+@app.post("/api/library/{book_id}/keep-looking")
+async def keep_looking(book_id: int):
+    """An admin turns down the release a search found: the book goes back to Wanted, and that release
+    is never picked again."""
+    book = _get_or_404(book_id)
+    if book["status"] != "requested" or not book.get("found_by_search"):
+        raise HTTPException(409, "Only a release that searching found on its own can be turned down this way.")
+    try:
+        book = wanted.keep_looking(book)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    log.info("Turned down the release found for %s (book %s); still looking", book["title"], book_id)
+    return book
 
 
 # ---- import ---------------------------------------------------------------------
@@ -910,6 +1047,25 @@ def _busy() -> set[int]:
 async def tidy_preview(body: TidyOptions):
     """Where every finished book would go under the folder layout in Settings. Moves nothing."""
     return await asyncio.to_thread(tidy.preview, config.load(), body.prefer, _busy())
+
+
+class FillDetails(BaseModel):
+    batch: int = 12
+
+
+@app.post("/api/tidy/fill-details")
+async def tidy_fill_details(body: FillDetails):
+    """Ask Audible for the series, narrators and year that library books are missing, a few at a time.
+    Call again until `remaining` is 0. Each book is asked once; only empty details are filled."""
+    todo = [b for b in db.list_books() if wanted.details_due(b)]
+    batch, filled = todo[:max(1, min(body.batch, 25))], 0
+    for b in batch:
+        try:
+            if await wanted.fill_from_audible(b):
+                filled += 1
+        except audible.AudibleError as e:
+            raise HTTPException(502, str(e))
+    return {"checked": len(batch), "filled": filled, "remaining": len(todo) - len(batch)}
 
 
 @app.get("/api/tidy/status")
@@ -1023,16 +1179,19 @@ async def follow_detail(follow_id: int):
     try:
         if f["kind"] == "author":
             info = await audible.author(f["asin"])
-            found = await audible.author_books(f["asin"], f["name"])
+            found = await audible.tidy_series(await audible.author_books(f["asin"], f["name"]))
         else:
             info = {"description": ""}
             _, found = await audible.series_books(f["asin"])
     except audible.AudibleError as e:
         raise HTTPException(502, str(e))
     books = db.list_books()
+    # Books already in Audiobookshelf count as yours, even though Narratarr didn't fetch them.
+    shelf = wanted.owned_index(await audiobookshelf.owned(config.load()))
     for b in found:
         lib = wanted.in_library(b["asin"], b["title"], b["author"], books)
         b["library"] = {"id": lib["id"], "status": lib["status"]} if lib else None
+        b["abs"] = not lib and wanted.in_owned(b, shelf)
     return {**f, "known": len(f["known"]), "description": info.get("description", ""), "books": found,
             **wanted.follow_counts(f, books)}
 
@@ -1042,7 +1201,7 @@ async def want_all(follow_id: int, request: Request):
     _follows_allowed(request)
     f = _follow_or_404(follow_id)
     detail = await follow_detail(follow_id)
-    added = sum(1 for b in detail["books"] if not b["library"] and wanted.add_wanted(b))
+    added = sum(1 for b in detail["books"] if not b["library"] and not b.get("abs") and wanted.add_wanted(b))
     if added:
         _background(_auto_search_now())
     return {"added": added, "name": f["name"]}
@@ -1096,8 +1255,9 @@ async def apply_update(body: Update):
 LISTENER_SETTINGS = (
     "rd_configured", "ad_configured", "tb_configured", "pm_configured", "brave_configured", "prowlarr_configured", "torznab_configured", "indexer_configured",
     "usenet_configured", "torrent_configured",
-    "usenet_client", "torrent_client", "smart_search", "search_provider", "audible_region", "check_updates",
-    "auto_search", "auto_search_hours", "listener_approval", "languages",
+    "usenet_client", "torrent_client", "smart_search", "search_provider", "audible_region", "audible_extra_regions",
+    "check_updates",
+    "auto_search", "auto_search_hours", "listener_approval", "languages", "found_needs_approval",
 )
 
 
@@ -1136,6 +1296,25 @@ async def test_prowlarr():
         raise HTTPException(400, str(e))
 
 
+class RegionProbe(BaseModel):
+    region: str = ""
+
+
+@app.post("/api/settings/test-audnex-region")
+async def test_audnex_region(body: RegionProbe):
+    """Fetch one known ASIN from one storefront, so a user can see which of their regions answer."""
+    from .ratings.audnex import AudnexProvider, AudnexUnavailable
+
+    region = (body.region or "").strip().lower()
+    if region not in config.AUDNEX_REGIONS:
+        raise HTTPException(400, f"'{region}' isn't an Audible storefront Audnex serves.")
+    provider = AudnexProvider(ratings.get_store(), regions=[region])
+    try:
+        return await provider.check_region(PROBE_ASIN, region)
+    except AudnexUnavailable as e:
+        return {"region": region, "ok": False, "reason": str(e)}
+
+
 @app.post("/api/settings/test-torznab")
 async def test_torznab():
     s = config.load()
@@ -1143,6 +1322,149 @@ async def test_torznab():
         return await Torznab(s.torznab_url, s.torznab_api_key, s.torznab_categories).status()
     except TorznabError as e:
         raise HTTPException(400, str(e))
+
+
+@app.get("/api/download-clients")
+async def download_clients():
+    """The configured clients, secrets masked, plus what the UI needs to offer in a picker."""
+    s = config.load()
+    out = []
+    for entry in downloaders.entries(s):
+        row = entry.public()
+        row["default"] = entry.id == s.default_client
+        out.append(row)
+    return {
+        "clients": out,
+        "default_client": s.default_client,
+        # Where a release with no matching rule goes, per protocol: what the cards show as Default.
+        "defaults": {"torrent": routing.default_for(s, "torrent"), "usenet": routing.default_for(s, "usenet")},
+        "types": [{"type": t, "label": downloaders.LABELS[t], "delivery": downloaders.DELIVERY[t]}
+                  for t in downloaders.DELIVERY],
+    }
+
+
+class ClientProbe(BaseModel):
+    id: str = ""
+    entry: dict | None = None
+
+
+async def _debrid_account(entry) -> dict:
+    """What a debrid service says about the account behind a key, in one line for the Test button."""
+    async with downloaders.client_for(entry) as cloud:
+        user = await cloud.user()
+    if entry.type == "realdebrid":
+        until = str(user.get("expiration") or "")[:10]
+        return {"summary": f"Connected as {user.get('username')} · {user.get('type')}" + (f" until {until}" if until else "")}
+    if entry.type == "alldebrid":
+        u = _ad_user(user)
+        if not u["premium"] and not u["trial"]:
+            raise ClientError(f"Connected as {u['username']}, but the account isn't premium. AllDebrid needs premium for torrents.")
+        return {"summary": f"Connected as {u['username']} · {'free trial' if u['trial'] else 'premium'}"}
+    if entry.type == "torbox":
+        u = _tb_user(user)
+        return {"summary": "Connected" + (f" as {u['email']}" if u["email"] else "") + (f" · {u['plan']} plan" if u["plan"] else "")}
+    if not user.get("premium"):
+        raise ClientError("Connected, but the account isn't premium. Premiumize needs premium for torrents.")
+    return {"summary": "Connected · premium"}
+
+
+@app.post("/api/settings/test-download-client")
+async def test_download_client(body: ClientProbe):
+    """Prove one client can reach its daemon. Accepts an unsaved entry so Test works before Save.
+
+    A masked secret in an unsaved entry is filled from the saved client with the same id, under the
+    same rule saving uses: only while it still points at the same machine.
+    """
+    s = config.load()
+    raw = body.entry
+    if not raw and body.id:
+        raw = next((c for c in s.clients if c.get("id") == body.id), None)
+    try:
+        cleaned = config.validate_clients([raw]) if isinstance(raw, dict) and raw.get("type") else []
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if cleaned:
+        cleaned = config._merge_client_secrets(cleaned, s.clients)
+    entry = downloaders.entry_from_dict(cleaned[0]) if cleaned else None
+    if entry is None:
+        raise HTTPException(400, "Pick a client type first.")
+    if not entry.configured:
+        need = "its API key" if entry.is_debrid else "its address"
+        raise HTTPException(400, f"{entry.label} needs {need} filled in first.")
+    try:
+        if entry.is_debrid:
+            return {"label": entry.label, **await _debrid_account(entry)}
+        async with downloaders.client_for(entry) as client:
+            return {"label": client.label, "version": await client.version()}
+    except (ClientError, AllDebridError, TorBoxError, PremiumizeError, RealDebridError) as e:
+        raise HTTPException(400, str(e))
+    except httpx.HTTPError:
+        raise HTTPException(502, f"Couldn't reach {entry.label}.")
+
+
+@app.get("/api/indexers")
+async def indexers():
+    """The indexers the user's sources actually advertise, for the routing picker.
+
+    Populated from Prowlarr and from the Torznab indexer's own caps, because a rule that names an
+    indexer nobody advertises can never match and would look like a broken feature.
+    """
+    s = config.load()
+    names: list[str] = []
+    notes: list[str] = []
+    if s.prowlarr_url and s.prowlarr_api_key:
+        try:
+            names += await Prowlarr(s.prowlarr_url, s.prowlarr_api_key).offering() or []
+        except ProwlarrError as e:
+            notes.append(f"Prowlarr: {e}")
+    if s.torznab_url and s.torznab_api_key:
+        try:
+            names.append((await Torznab(s.torznab_url, s.torznab_api_key, s.torznab_categories).status())["title"])
+        except TorznabError as e:
+            notes.append(f"Torznab: {e}")
+    # A source that names no indexer on its releases is routed by its own name instead. That is
+    # AudiobookBay always, and a Torznab feed whose items carry no indexer of their own. Prowlarr
+    # always names the indexer, so "Prowlarr" itself could never match and isn't offered.
+    names.append(get_source("audiobookbay").label)
+    if s.torznab_url and s.torznab_api_key:
+        names.append(get_source("torznab").label)
+    return {"indexers": sorted({n for n in names if n}, key=str.lower), "notes": notes}
+
+
+class RouteProbe(BaseModel):
+    indexer: str = ""
+    kind: str = "audiobook"
+    protocol: str = ""
+
+
+@app.post("/api/routing/test")
+async def test_route(body: RouteProbe):
+    """What would take a sample release, and with which arguments. Grabs nothing."""
+    s = config.load()
+    entry_for = {e.id: e for e in downloaders.entries(s)}
+    decision = routing.resolve(s, body.indexer, body.kind or "audiobook", body.protocol)
+    entry = entry_for.get(decision.client_id)
+    return {
+        "client": decision.client_id,
+        "client_label": entry.label if entry else "",
+        "delivery": entry.delivery if entry else "",
+        "rule": decision.rule,
+        "reason": decision.reason,
+        "problems": decision.problems,
+        "args": {
+            "category": decision.label or (entry.category if entry else ""),
+            "save_path": decision.save_path or (entry.save_path if entry else ""),
+        },
+    }
+
+
+@app.get("/api/routing/coverage")
+async def routing_coverage():
+    """Which indexers no rule covers, and rules naming a client that no longer exists."""
+    s = config.load()
+    advertised = (await indexers())["indexers"]
+    cov = routing.coverage(s, advertised)
+    return {**cov, "indexers": advertised, "rules": routing.routes(s)}
 
 
 @app.post("/api/settings/test-client/{name}")
@@ -1430,7 +1752,10 @@ async def abs_find(body: FindServer):
     for server in servers:
         server["public"] = await asyncio.to_thread(audiobookshelf.is_public, server["url"])
         server["insecure"] = server["public"] and server["url"].startswith("http://")
-    return {"servers": servers}
+    reason = ""
+    if not servers:  # say why, and what to type instead
+        reason = await audiobookshelf.why_not(body.address) if body.address.strip() else audiobookshelf.nothing_nearby()
+    return {"servers": servers, "reason": reason}
 
 
 class SignIn(BaseModel):

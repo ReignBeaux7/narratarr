@@ -27,7 +27,8 @@ PROXY_HEADERS = ("x-forwarded-for", "x-real-ip", "forwarded", "cf-connecting-ip"
 # Paths anyone may use. Everything else under /api/ needs a signed-in user.
 OPEN = {"/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/setup"}
 # Paths only admins may use (any method), and admin-only method/path pairs.
-ADMIN_PREFIXES = ("/api/users", "/api/settings/", "/api/audiobookshelf", "/api/import", "/api/updates/apply", "/api/tidy")
+ADMIN_PREFIXES = ("/api/users", "/api/settings/", "/api/audiobookshelf", "/api/import", "/api/updates/apply", "/api/tidy",
+                  "/api/download-clients", "/api/indexers", "/api/routing")
 LOGIN_TRIES = 8  # per address, every LOGIN_WINDOW seconds
 LOGIN_WINDOW = 10 * 60
 
@@ -61,7 +62,7 @@ def current_user(request) -> dict | None:
 def admin_only(method: str, path: str) -> bool:
     if path.startswith(ADMIN_PREFIXES) or (path == "/api/settings" and method != "GET"):
         return True
-    if path.startswith("/api/library/") and path.endswith("/approve"):
+    if path.startswith("/api/library/") and path.endswith(("/approve", "/keep-looking", "/audible-match")):
         return True
     # Removing a book is checked in the route itself: a listener may cancel their own request.
     return method == "PATCH" and path.startswith("/api/library/")

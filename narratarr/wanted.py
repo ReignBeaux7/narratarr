@@ -19,7 +19,7 @@ from urllib.parse import urlencode
 
 from rapidfuzz import fuzz
 
-from . import audible, config, db, downloaders, ebooks, languages
+from . import audible, config, db, downloaders, ebooks, languages, notify
 from .search import clean_title, normalize
 from .sources import CATALOGS, ProwlarrError, TorznabError, ebook_indexers, ebook_torznab, get_source
 
@@ -127,8 +127,37 @@ async def find_releases(book: dict) -> list[dict]:
     return found
 
 
-def best(found: list[dict]) -> dict | None:
+MAX_FAILED_RETRIES = 2  # releases tried in place of failed ones, per book, before it's left to a person
+
+
+def info_hash_of(item: dict) -> str:
+    return str(item.get("info_hash") or item.get("infohash") or item.get("infoHash") or "").strip().lower()
+
+
+def avoid(book: dict) -> tuple[set[str], set[str]]:
+    """The release links and torrent hashes automatic picking stays away from for this book: what an
+    admin turned down, and what failed to download. The same torrent from another indexer fails the same way."""
+    failed = book.get("failed_releases") or []
+    urls = {*(book.get("skipped_releases") or []), *(f.get("url", "") for f in failed)}
+    hashes = {str(f.get("info_hash") or "").lower() for f in failed}
+    return urls - {""}, hashes - {""}
+
+
+def failed_release(book: dict, item: dict) -> str | None:
+    """Why this release failed for this book before, or None if it didn't."""
+    h = info_hash_of(item)
+    for f in book.get("failed_releases") or []:
+        if (f.get("url") and f["url"] == item.get("url")) or (h and str(f.get("info_hash") or "").lower() == h):
+            return f.get("error") or "It failed to download before."
+    return None
+
+
+def best(found: list[dict], skip: list[str] | set[str] | tuple = (), skip_hashes: set[str] | tuple = ()) -> dict | None:
+    """The release to take on our own: usable, in a wanted language, a sure match, not turned down or
+    failed before."""
     for item in found:
+        if item["url"] in skip or (skip_hashes and info_hash_of(item) in skip_hashes):
+            continue
         if item["usable"] and item.get("language_ok", True) and item["match"] >= AUTO_MATCH and item.get("seeders") != 0:
             return item
     return None
@@ -146,20 +175,38 @@ async def grab(book_id: int, url: str, source_name: str, status: str = "queued")
         size=d.size or book["size"], indexer=d.indexer, release=d.release or d.title,
         description=book["description"] or d.description, cover_url=book["cover_url"] or d.cover_url,
         status=status, error="", detail="", progress=0, client_job_id="", download_client="", rd_torrent_id="",
-        search_note="",
+        search_note="", found_by_search=0,
     )
     return db.get(book_id)
 
 
-async def search_and_grab(book: dict) -> dict | None:
-    """Look for a Wanted book once. Returns the chosen release, or None if nothing good turned up."""
+def keep_looking(book: dict) -> dict:
+    """Turn down the release a search found for a book and go back to looking. That release is
+    remembered, so the next search doesn't pick it again."""
+    source = next((n for n in CATALOGS if get_source(n).owns(book["source_url"].split("#")[0])), "")
+    if not source:
+        raise ValueError("This book didn't come from a catalog, so there's nothing to go back to looking for.")
+    skipped = list(dict.fromkeys([*(book.get("skipped_releases") or []), book["release_url"]]))
+    db.update(
+        book["id"], source=source, status="wanted", release_url="", protocol="", download_url="", info_hash="",
+        trackers=[], files=[], indexer="", release="", found_by_search=0, skipped_releases=[u for u in skipped if u],
+        error="", detail="", search_note="Turned down a release. Still looking.", last_searched=time.time(),
+    )
+    return db.get(book["id"])
+
+
+async def search_and_grab(book: dict, hold: bool = False) -> dict | None:
+    """Look for a Wanted book once. Returns the chosen release, or None if nothing good turned up.
+
+    With `hold`, the release isn't downloaded: the book waits under Awaiting approval with it
+    picked, and the admins are told, so someone can check its language, format and size first."""
     db.update(book["id"], last_searched=time.time())
     try:
         found = await find_releases(book)
     except ProwlarrError as e:
         db.update(book["id"], search_note=str(e))
         raise
-    pick = best(found)
+    pick = best(found, *avoid(book))
     if not pick:
         close = [f for f in found if f["match"] >= AUTO_MATCH]
         note = (
@@ -173,6 +220,11 @@ async def search_and_grab(book: dict) -> dict | None:
                         "Add one that does in Prowlarr.")
         db.update(book["id"], search_note=note)
         return None
+    if hold:
+        await grab(book["id"], pick["url"], pick["source"], "requested")
+        db.update(book["id"], found_by_search=1)
+        notify.emit("found", db.get(book["id"]))
+        return pick
     await grab(book["id"], pick["url"], pick["source"])
     return pick
 
@@ -197,18 +249,106 @@ def due_for_search() -> list[dict]:
 
 
 async def auto_search() -> int:
-    """One round of automatic searching. Returns how many books were grabbed."""
+    """One round of automatic searching. Returns how many books were grabbed (or held for approval)."""
     s = config.load()
     if not (s.auto_search and ((s.prowlarr_url and s.prowlarr_api_key) or (s.torznab_url and s.torznab_api_key))):
         return 0
     grabbed = 0
     for b in due_for_search():
         try:
-            if await search_and_grab(b):
+            if await search_and_grab(b, hold=s.found_needs_approval):
                 grabbed += 1
         except Exception as e:  # one bad search shouldn't stop the round
             log.info("Automatic search for %s failed: %s", b["title"], e)
     return grabbed
+
+
+# ---- filling in a library book's details from Audible -------------------------
+
+
+# "Playing for Keeps #1 - Consider Me", "Mistborn, Book 2 - The Well of Ascension", "Discworld Vol. 3: Equal
+# Rites": a folder name that leads with its series. Only an explicit marker (#, Book, Vol) counts, so a
+# title that merely has a number in it ("Catch-22 - A Novel") is never split.
+_SERIES_FIRST = re.compile(
+    r"^(?P<series>[^#]+?)\s*(?:#\s*|,?\s+(?:book|bk\.?|vol\.?|volume)\s*)(?P<number>\d+(?:\.\d+)?)\s*[-–—:]\s*(?P<title>\S.*)$",
+    re.I)
+
+
+def series_first(title: str) -> tuple[str, str, str] | None:
+    """(series, number, title) when a book's name starts with its series, else None."""
+    m = _SERIES_FIRST.match((title or "").strip())
+    if not m or not normalize(m["series"]) or not normalize(m["title"]):
+        return None
+    return m["series"].strip(" -–—,:"), m["number"].lstrip("0") or "0", m["title"].strip()
+
+
+def _in_series(match: dict, series: str) -> bool:
+    want = normalize(audible.series_name(series))
+    return any(normalize(audible.series_name(s.get("title") or "")) == want for s in match.get("series") or [])
+
+
+async def audible_match(book: dict) -> dict | None:
+    """Audible's record of this book: by its ASIN when it has one, else the search result whose title
+    and author both match. Nothing at all rather than a near miss: a wrong series is worse than none.
+
+    A name that leads with its series ("Playing for Keeps #1 - Consider Me") is also tried as its
+    title alone, and then Audible's book has to be in that series too. The match says so in
+    `series_first`, the book's name without the series, which the series fields now hold."""
+    if book.get("asin"):
+        return await audible.book(book["asin"], r=audible.region_from_url(book.get("source_url") or "") or None)
+    title, author = main_title(book.get("title") or ""), first_author(book.get("author") or "")
+    if not title or not author:
+        return None
+    found, _ = await audible.search_books(f"{title} {author}")
+    hit = next((b for b in found if _titles_match(b["title"], b["author"], book["title"], book["author"])), None)
+    if hit or not (split := series_first(book.get("title") or "")):
+        return hit
+    series, _number, alone = split
+    found, _ = await audible.search_books(f"{main_title(alone)} {author}")
+    hit = next((b for b in found if _titles_match(b["title"], b["author"], alone, book["author"])
+                and _in_series(b, series)), None)
+    return {**hit, "series_first": alone} if hit else None
+
+
+def missing_details(book: dict) -> bool:
+    return not (book.get("series") and book.get("narrators") and book.get("released"))
+
+
+# When names that lead with their series started being understood (0.9.4). A book like that which was
+# checked before then gets one more look; after it, each book is still asked only once.
+SERIES_FIRST_SINCE = 1793992037
+
+
+def details_due(book: dict) -> bool:
+    """Whether Fill in missing details should ask Audible about this book."""
+    if book.get("status") != "completed" or not missing_details(book):
+        return False
+    checked = book.get("details_checked")
+    return not checked or (checked < SERIES_FIRST_SINCE and not book.get("series")
+                           and series_first(book.get("title") or "") is not None)
+
+
+async def fill_from_audible(book: dict) -> list[str]:
+    """Fill only what the book is missing (series, narrators, year, ASIN) from Audible. Returns what changed.
+    The one thing it rewrites is a title that leads with its series, once the series fields hold it."""
+    db.update(book["id"], details_checked=time.time())
+    match = await audible_match(book)
+    if not match:
+        return []
+    changes: dict = {}
+    if not book.get("series") and match.get("series"):
+        changes["series"] = [{**s, "title": audible.series_name(s["title"])} for s in match["series"][:1]]
+    if not book.get("narrators") and match.get("narrators"):
+        changes["narrators"] = match["narrators"][:4]
+    if not book.get("released") and match.get("released"):
+        changes["released"] = match["released"]
+    if not book.get("asin") and match.get("asin"):
+        changes["asin"] = match["asin"]
+    if match.get("series_first") and (book.get("series") or changes.get("series")):
+        changes["title"] = match["series_first"]  # the series is in its own fields now, not the title
+    if changes:
+        db.update(book["id"], **changes)
+    return list(changes)
 
 
 # ---- library helpers ----------------------------------------------------------
@@ -231,6 +371,23 @@ def in_library(asin: str, title: str, author: str, books: list[dict] | None = No
                                    or _titles_match(title, author, b["title"], b["author"])):
             return b
     return None
+
+
+def owned_index(owned: list[dict]) -> tuple[set, dict]:
+    """Books from somewhere else (Audiobookshelf), indexed so matching an author's whole list is quick."""
+    by_asin = {o["asin"] for o in owned if o.get("asin")}
+    by_author: dict[str, list[dict]] = {}
+    for o in owned:
+        by_author.setdefault(normalize(first_author(o["author"])), []).append(o)
+    return by_asin, by_author
+
+
+def in_owned(b: dict, index: tuple[set, dict]) -> bool:
+    by_asin, by_author = index
+    if b.get("asin") and b["asin"] in by_asin:
+        return True
+    return any(_titles_match(b["title"], b["author"], o["title"], o["author"])
+               for o in by_author.get(normalize(first_author(b.get("author") or "")), []))
 
 
 # The same book in its other format shares a folder with it, so this is stricter than in_library:

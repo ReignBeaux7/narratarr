@@ -280,6 +280,8 @@ Already running an \*arr stack? Narratarr searches the indexers in your Prowlarr
 
 Press **Test** next to each one. Once Prowlarr is connected, a **Prowlarr** tab (and an **Audible catalog** tab) appears on Discover. Each Prowlarr result shows its indexer, size, format, and whether it's Usenet or a torrent. Open one and Narratarr matches the release name to the real book, so it's filed under the right author and title, with cover art.
 
+**Routing a release to a particular client.** Settings → Downloads holds a list of clients and, under Routing, an ordered list of rules: the first rule that matches sends the release to its client, and anything unmatched goes to the default. A rule matches on the indexer that found the release, the kind of book, or both. Every grab logs which rule decided it, so a file that landed somewhere unexpected can be explained afterwards. With no rules, nothing changes. Full detail, including what the log lines look like and how to test a route before trusting it: **[docs/download-routing.md](docs/download-routing.md)**.
+
 **What happens after you press Download:**
 
 - **Usenet:** the NZB goes to SABnzbd or NZBGet. When it has downloaded, repaired and unpacked the release, Narratarr moves the files into your library and clears the job from the client's history.
@@ -304,6 +306,32 @@ Narratarr searches category `3030` (*Audio › Audiobook*) for audiobooks and `7
 > If the paths have to differ (say the client uses `/downloads` and Narratarr uses `/data/downloads`), fill in **Settings → Download folders → Path mapping**. Use your containers' names as the addresses, e.g. `http://prowlarr:9696`.
 >
 > **qBittorrent in Docker:** keep `WEBUI_PORT` the same as the port you publish (e.g. `8080:8080`). qBittorrent refuses connections that arrive on a different port.
+>
+> **Addresses from inside Docker:** `localhost` means Narratarr's own container, so use the IP address of the machine the other app runs on (e.g. `http://192.168.1.10:8080`), or its container name when both are on the same Docker network.
+>
+> **SABnzbd by container name:** SABnzbd only answers to names on its own list, so `http://sabnzbd:8080` is turned away until you add `sabnzbd` under SABnzbd's **Config → Special → host_whitelist** and restart it. Its IP address always works.
+>
+> **Audiobookshelf by container name:** inside a Docker network, Audiobookshelf listens on port 80, so its address is `http://audiobookshelf`, not `:13378` (that's the port published on the host).
+
+### Ratings on the cards
+
+Discover can show a star score on each book, taken from the average Audible publishes for the
+audiobook edition. It is **on by default** and switched off in **Settings → Search & sources →
+Rating metadata**; switched off, no requests are made at all and no pill is shown. Library cards show
+the same pill for books that have a score.
+
+A score appears only when the book we found is the book we asked for: the title must match exactly
+after normalising, and the surname must match too. A near miss leaves the card reading **No Rating**,
+and a book that exists but has no ratings yet reads **No Rating Available**. A wrong score is worse
+than a blank one, so the gate is strict rather than fuzzy.
+
+Audible sells different titles in different countries and the ratings service only answers from a
+storefront that carries the book, so the settings take an ordered list of them, with a **Test**
+button per row. The storefront that answered is remembered for that book, and the book's own home
+marketplace is tried as well, so a single `uk` entry is enough for most titles.
+
+Full details, including what is cached and for how long, how to fill a whole library before
+browsing, and what the feature cannot do: **[docs/ratings.md](docs/ratings.md)**.
 
 ### Wanted books and following authors
 
@@ -311,6 +339,10 @@ Some books aren't out yet, or aren't on your indexers yet. Put them on your **Wa
 
 - **Add any book:** the **Audible catalog** tab on Discover browses and searches Audible's whole store, including bestsellers, new releases, genres and books that haven't come out yet. Press **Add to Wanted**. Nothing is downloaded from Audible; it's only used for the book's details.
 - **Automatic search:** Narratarr checks your Prowlarr indexers, and LibriVox for public-domain titles, every 12 hours (adjustable). It only grabs a release when both the title *and* the author match, preferring free LibriVox recordings, M4B files and torrents with seeders. A few books are checked at a time to stay within your indexers' API limits, and books that aren't released yet wait until their release date.
+- **Ask before downloading:** turn on **Ask before downloading what it finds** (Settings → Search & sources) and a release that automatic search finds waits under **Library → Awaiting approval** instead of downloading. Check its language, format and size, then **Approve** it, **Pick another**, or **Keep looking**, which turns that release down for good. Add the **Release found** event to a notification to hear about each one.
+- **More Audible stores:** some books are only sold in another country, such as French titles on audible.fr. Under **More Audible stores to search**, pick the stores you want; everyone, listeners too, can then switch the Audible catalog to one of them for a search, and a search that finds nothing in your main store tries them in order. A book added from another store keeps its details from that store.
+- **Books you already have:** when Audiobookshelf is connected, author pages and the Audible catalog mark the books in your Audiobookshelf library as **In Audiobookshelf**, and **Add all missing** skips them.
+- **A download that fails gets another release:** when the release itself is bad (your download client says it failed, a debrid service says the torrent is dead, it finds no seeds in a week, or there's no audio in it), Narratarr picks the next best match the way automatic search would, up to twice per book, and holds it for approval if you've asked for that. A setup problem, such as a downloads folder Narratarr can't see, isn't retried, since another release would fail the same way. A release that failed is never picked on its own again, and **Pick a release** marks it **Failed before** (and ones you turned down **Turned down**). Switch it off under Settings → Search & sources.
 - **Pick a release yourself:** open a Wanted book and press **Pick a release** to see every match with a score, then **Grab** the one you want. The book keeps Audible's title, cover and description whichever release you pick.
 - **Audiobook, ebook or both:** when you add a book to Wanted, choose the format. You can also open any book in your library and press **Want it too** on the format you don't have yet. Ebooks are searched for in your indexers' ebook categories, and Narratarr keeps one file per book, preferring EPUB, then AZW3, MOBI and PDF. The ebook goes into the audiobook's folder (or the audiobook into the ebook's), which is how Audiobookshelf shows both as one book. A finished EPUB opens in Narratarr's own reader (pages you turn, Paper, Sepia and Night themes, text size and font, contents, and your place remembered), a PDF in your browser's viewer, and any ebook can be downloaded for Apple Books, Kindle, Kobo or another reading app.
 - **Follow authors and series:** on the **Authors** page, search for an author and press **Follow**, or press **Follow** on any book's author or series. Their new releases (and, if you like, everything already out) go straight to Wanted. Each author and series page shows their books, what's in your library, and an **Add all missing** button.
@@ -377,6 +409,16 @@ Settings has one-click presets for these, including an **Audiobookshelf style** 
 - **Optional extras.** Add the cover, `desc.txt` and `reader.txt` Audiobookshelf reads, where a folder lacks them. Or write the details into the audio files' tags (MP3, M4B/M4A, FLAC, Ogg, Opus) so every app agrees. Tag writing changes your files, and Undo doesn't change the tags back.
 
 Audiobookshelf rescans once when tidying finishes, if it's connected.
+
+Books whose tags don't say their series, narrator or year are filed as singles. **Fill in missing details** (next to **Preview changes**) asks Audible for them, only for books whose title and author match exactly, and never overwrites what a book already has. A name that leads with its series, such as `Playing for Keeps #1 - Consider Me`, is matched by its title alone as long as Audible has it in that series, and then loses the prefix, since the series fields hold it. For a single book, open it and use **Edit details**: set the series, its number and the year yourself, or press **Fill in from Audible**.
+
+**Tidying a library Narratarr didn't download.** Tidy works on the books in Narratarr's library, so bring the others in first without moving them:
+
+1. **Library → Import books**, choose your books folder, and pick **Leave where they are**. Each book is added where it is; nothing is copied or moved.
+2. **Settings → General → Tidy your library → Fill in missing details**, for the series, narrators and years your folder names and tags don't have. This only changes Narratarr's own records, never your files.
+3. **Preview changes**, pick the books, and **Move** them, with **Write these details into the audio files' tags** left off.
+
+Moving is renaming, so the files themselves don't change: a torrent client seeding from a hardlink of a file keeps seeding, because its link still points at the same, untouched file. Writing tags does change the files, which breaks seeding from hardlinks, so leave that switch off if you seed.
 
 ### Languages
 

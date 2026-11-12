@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import httpx
 
@@ -32,9 +34,42 @@ class AudibleError(Exception):
     pass
 
 
+NAMES = {
+    "us": "United States", "uk": "United Kingdom", "ca": "Canada", "au": "Australia", "in": "India",
+    "de": "Germany", "fr": "France", "it": "Italy", "es": "Spain", "jp": "Japan",
+}
+_REGION_OF_TLD = {tld: r for r, tld in TLDS.items()}
+# One search can ask another store than the main one (a listener looking for a French book on audible.fr),
+# without changing the setting for everyone. Set only for the length of that request.
+_override: ContextVar[str] = ContextVar("audible_region", default="")
+
+
 def region() -> str:
-    r = config.load().audible_region
+    r = _override.get() or config.load().audible_region
     return r if r in TLDS else "us"
+
+
+def regions() -> list[str]:
+    """The stores people can search: the main one first, then the extra ones an admin turned on."""
+    s = config.load()
+    main = s.audible_region if s.audible_region in TLDS else "us"
+    return [main] + [r for r in s.audible_extra_regions if r in TLDS and r != main]
+
+
+@contextmanager
+def using(r: str):
+    """Ask this store for the rest of the block. An empty or unknown code means the main store."""
+    token = _override.set(r if r in TLDS else "")
+    try:
+        yield
+    finally:
+        _override.reset(token)
+
+
+def region_from_url(url: str) -> str:
+    """The store a book link is from: audible.fr/pd/... is "fr". "" when it isn't an Audible link."""
+    m = re.search(r"audible\.([a-z.]+)/pd/", url or "")
+    return _REGION_OF_TLD.get(m.group(1), "") if m else ""
 
 
 def api_base(r: str | None = None) -> str:
@@ -162,8 +197,8 @@ async def search_books(query: str, page: int = 1, client=None) -> tuple[list[dic
     return _keep([to_book(p, r) for p in data.get("products") or []], r), max(1, min(10, -(-total // 40)))
 
 
-async def products(asins: list[str], client=None) -> list[dict]:
-    r = region()
+async def products(asins: list[str], client=None, r: str | None = None) -> list[dict]:
+    r = r if r in TLDS else region()
     out = []
     for i in range(0, len(asins), 50):
         chunk = asins[i : i + 50]
@@ -172,8 +207,9 @@ async def products(asins: list[str], client=None) -> list[dict]:
     return out
 
 
-async def book(asin: str, client=None) -> dict | None:
-    found = await products([asin], client)
+async def book(asin: str, client=None, r: str | None = None) -> dict | None:
+    """One book, from the store `r` (a book added from audible.fr is looked up there), else the main one."""
+    found = await products([asin], client, r)
     return found[0] if found else None
 
 
@@ -223,6 +259,53 @@ async def author_books(asin: str, name: str, client=None, pages: int = 4) -> lis
         if len(batch) < 50:
             break
     return _keep(found, r)
+
+
+_EDITION_NOTE = re.compile(r"\s*[(\[]\s*(un)?abridged(\s+edition)?\s*[)\]]\s*$", re.I)
+
+
+def series_name(title: str) -> str:
+    """'Emperor (abridged)' is the same series as 'Emperor'."""
+    return _EDITION_NOTE.sub("", title or "").strip() or (title or "")
+
+
+async def series_members(asin: str, client=None) -> dict[str, str]:
+    """The books a series lists as its own, {asin: number in the series}."""
+    data = await _get(f"{api_base()}/products/{asin}", {"response_groups": "relationships"}, client) or {}
+    return {
+        rel["asin"]: str(rel.get("sequence") or "")
+        for rel in (data.get("product") or {}).get("relationships") or []
+        if rel.get("relationship_to_product") == "child" and rel.get("asin")
+    }
+
+
+async def tidy_series(books: list[dict], client=None, most: int = 12) -> list[dict]:
+    """An author's books, grouped the way a reader expects.
+
+    Audible keeps an abridged edition in a series of its own ("Emperor (abridged)"), and a book's own
+    record sometimes leaves out the series it belongs to even though the series lists it. So: series
+    names lose their edition note, a book with no series is placed in the series that lists it, and an
+    abridged edition is dropped when the unabridged one is there too."""
+    titles = {s["asin"]: series_name(s["title"]) for b in books for s in b["series"] if s.get("asin")}
+    asins = list(titles)[:most]
+    found = await asyncio.gather(*(series_members(a, client) for a in asins), return_exceptions=True)
+    for sasin, members in zip(asins, found):
+        if isinstance(members, BaseException):
+            continue
+        for b in books:
+            if not b["series"] and b["asin"] in members:
+                b["series"] = [{"asin": sasin, "title": titles[sasin], "sequence": members[b["asin"]]}]
+    for b in books:
+        b["series"] = [{**s, "title": series_name(s["title"])} for s in b["series"]]
+
+    def key(b: dict) -> tuple:
+        s = b["series"][0] if b["series"] else None
+        if s and s.get("sequence"):
+            return ("series", s["title"].lower(), s["sequence"])
+        return ("title", re.sub(r"\W+", " ", edition_free(b["title"]).lower()).strip())
+
+    whole = {key(b) for b in books if not b.get("abridged")}
+    return [b for b in books if not (b.get("abridged") and key(b) in whole)]
 
 
 async def series_books(asin: str, client=None) -> tuple[str, list[dict]]:

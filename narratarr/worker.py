@@ -32,8 +32,8 @@ from pathlib import Path
 
 import httpx
 
-from . import audiobookshelf, config, db, downloaders, ebooks, importer, layout, media, notify, wanted
-from .downloaders import ClientError, debrid_client
+from . import audiobookshelf, config, db, downloaders, ebooks, importer, layout, media, notify, routing, wanted
+from .downloaders import ClientError, bad_release, is_bad_release
 from .alldebrid import AllDebridError
 from .premiumize import PremiumizeError
 from .torbox import TorBoxError
@@ -345,6 +345,8 @@ class Worker:
         ) as e:
             log.warning("Book %s failed: %s", book_id, readable_error(e))
             db.update(book_id, status="failed", error=readable_error(e), speed=0, detail="")
+            if is_bad_release(e) and announce and await self._try_another_release(book_id):
+                return  # another release is on its way (or waiting for approval), and said so itself
         except Exception as e:
             log.exception("Book %s crashed", book_id)
             db.update(book_id, status="failed", error=f"Unexpected error: {e}", speed=0, detail="")
@@ -352,6 +354,41 @@ class Worker:
             return
         if announce and (failed := db.get(book_id)):
             notify.emit("failed", failed, error=failed["error"])
+
+    async def _try_another_release(self, book_id: int) -> bool:
+        """The release itself failed (a dead torrent, a failed repair, no audio in it). Remember it, so
+        nothing picks it again, then look for another release of the book once and take the best sure
+        match, the same way automatic search would. Only for that kind of failure: a setup problem (an
+        unreachable client, a folder Narratarr can't see) would only fail the same way again.
+
+        Returns True when another release was grabbed or is waiting for approval."""
+        book = db.get(book_id)
+        if not book or not book.get("release_url"):
+            return False
+        failed = [f for f in book.get("failed_releases") or [] if f.get("url") != book["release_url"]]
+        failed.append({"url": book["release_url"], "info_hash": (book.get("info_hash") or "").lower(),
+                       "error": book.get("error") or "", "at": time.time()})
+        db.update(book_id, failed_releases=failed[-50:])
+        settings = config.load()
+        if not settings.retry_failed_downloads or book.get("failed_retries", 0) >= wanted.MAX_FAILED_RETRIES:
+            return False
+        if get_source(book["source"]).delivery == "direct":
+            return False  # LibriVox and the like have one copy of a book: there's no other release
+        error = book.get("error") or ""
+        try:
+            pick = await wanted.search_and_grab(db.get(book_id), hold=settings.found_needs_approval)
+        except Exception as e:  # no indexer reachable right now: leave it failed, a person can retry
+            log.info("Book %s: couldn't look for another release: %s", book_id, e)
+            db.update(book_id, status="failed", error=error)
+            return False
+        if not pick:
+            db.update(book_id, status="failed", error=f"{error} Looked for another release, but none was a sure match.")
+            return False
+        db.update(book_id, failed_retries=book.get("failed_retries", 0) + 1,
+                  search_note=f"The last release failed ({error}), so Narratarr picked another.")
+        log.info("Book %s: the release failed, so it took another: %s", book_id, pick.get("release") or pick.get("title"))
+        self.poke()
+        return True
 
     # ---- pipeline ---------------------------------------------------------
 
@@ -366,12 +403,52 @@ class Worker:
             await self._process_direct(book, source)
         elif source.delivery == "wanted":
             raise ValueError("Pick a release for this book first: open it and choose Find releases.")
-        elif book["protocol"] == "usenet":
-            await self._process_usenet(book)
-        elif config.load().torrent_client not in downloaders.DEBRID:
-            await self._process_torrent_client(book, source)
         else:
-            await self._process_torrent(book, source)
+            settings = config.load()
+            # A source that names no indexer per release (AudiobookBay) is routed by its own name, the
+            # same name Discover's chip and the Settings picker use.
+            indexer = book["indexer"] or source.label
+            decision = routing.resolve(settings, indexer, wanted.kind_of(book), book["protocol"])
+            chosen = downloaders.entry_from_dict(
+                next((c for c in settings.clients if c.get("id") == decision.client_id), {}) or {}
+            )
+            # One line, every grab, whether a rule matched or not.
+            log.info("Book %s (%s, kind %s): %s", book["id"], indexer or "unknown indexer",
+                     wanted.kind_of(book), decision.reason)
+            for problem in decision.problems:
+                log.warning("Book %s: %s", book["id"], problem)
+            if decision.matched and chosen is None:
+                raise ValueError(f"A route sent this release to '{decision.client_id}', which does not exist. "
+                                 "Fix it under Settings → Downloads → Routing.")
+            if chosen is None:
+                # Nothing usable, but there may be a client that was saved before anyone filled it
+                # in. Naming it is the difference between "add a download client" and "your Deluge
+                # needs an address".
+                proto = "usenet" if book["protocol"] == "usenet" else "torrent"
+                drafts = [e for e in downloaders.entries(settings) if e.delivery == proto and not e.configured]
+                if drafts:
+                    def needs(e) -> str:
+                        if e.is_debrid:
+                            return "API key"
+                        return "address and API key" if e.type == "sabnzbd" else "address"
+                    if len(drafts) == 1:
+                        e = drafts[0]
+                        raise ValueError(f"{e.label} isn't set up yet. Add its {needs(e)} under "
+                                         "Settings → Downloads, then grab this again.")
+                    names = ", ".join(e.label for e in drafts[:-1]) + f" and {drafts[-1].label}"
+                    raise ValueError(f"{names} aren't set up yet. Fill them in under Settings → Downloads, "
+                                     "then grab this again.")
+                if book["protocol"] == "usenet":
+                    raise ValueError("Nothing can take a Usenet release: add SABnzbd or NZBGet under "
+                                     "Settings → Downloads.")
+                raise ValueError("Add a download client in Settings before grabbing anything.")
+
+            if chosen.delivery == "usenet":
+                await self._process_usenet(book, chosen, decision)
+            elif chosen.is_debrid:
+                await self._process_torrent(book, source, chosen, decision)
+            else:
+                await self._process_torrent_client(book, source, chosen, decision)
 
     def _fresh_tmp(self, book: dict, settings: config.Settings) -> Path:
         tmp = tmp_dir(book, settings)
@@ -413,12 +490,12 @@ class Worker:
         await self._download(book_id, files, tmp)
         await self._finish(book, tmp, settings)
 
-    async def _process_torrent(self, book: dict, source) -> None:
+    async def _process_torrent(self, book: dict, source, entry, decision) -> None:
         """Torrents through a cloud service (Real-Debrid, AllDebrid, TorBox or Premiumize): it fetches them, we download
         the files."""
         settings = config.load()
         book_id = book["id"]
-        async with debrid_client(settings, self._transport) as cloud:
+        async with downloaders.client_for(entry, self._transport) as cloud:
             # A job id is only reused on the service that made it (AllDebrid's are stored as "ad:<id>").
             stored = book["rd_torrent_id"]
             mine = stored.startswith(cloud.prefix) and (cloud.prefix or ":" not in stored)
@@ -487,14 +564,14 @@ class Worker:
             return job_id
         return ""
 
-    async def _process_usenet(self, book: dict) -> None:
+    async def _process_usenet(self, book: dict, entry, decision) -> None:
         """Usenet releases: hand the NZB to SABnzbd or NZBGet, wait, then move in what it unpacked."""
         settings = config.load()
         book_id = book["id"]
-        name = settings.usenet_client
+        name = entry.id
         tmp = tmp_dir(book, settings)
         leftover = bool(book["client_job_id"]) and has_files(tmp)  # an interrupted run got this far
-        async with downloaders.usenet_client(settings, self._transport) as client:
+        async with downloaders.client_for(entry, self._transport) as client:
             job_id = await self._resume_job(client, book, name)
             if not job_id and leftover:
                 job_id = ""
@@ -509,7 +586,7 @@ class Worker:
                 if kind != "nzb":
                     raise ProwlarrError("The indexer sent a torrent for this Usenet release.")
                 label = safe_name(f"{book['author']} - {book['title']}" if book["author"] else book["title"])
-                job_id = await client.add_nzb(nzb, f"{label}.nzb", label, downloaders.category_for(settings, name))
+                job_id = await client.add_nzb(nzb, f"{label}.nzb", label, entry.category)
                 db.update(book_id, download_client=name, client_job_id=job_id)
 
             db.update(book_id, status="downloading", progress=0, detail=f"Sent to {client.label}")
@@ -528,23 +605,24 @@ class Worker:
 
         await self._finish(book, tmp, settings, client_job_id="")
         try:
-            async with downloaders.usenet_client(settings, self._transport) as client:
+            async with downloaders.client_for(entry, self._transport) as client:
                 await client.forget(job_id)
         except ClientError:
             log.info("Couldn't clear job %s from the Usenet client's history", job_id)
 
-    async def _process_torrent_client(self, book: dict, source) -> None:
+    async def _process_torrent_client(self, book: dict, source, entry, decision) -> None:
         """Torrents through the user's own qBittorrent, Transmission or Deluge. The torrent keeps seeding afterwards."""
         settings = config.load()
         book_id = book["id"]
-        name = settings.torrent_client
-        async with downloaders.torrent_client(settings, self._transport) as client:
+        name = entry.id
+        async with downloaders.client_for(entry, self._transport) as client:
             job_id = await self._resume_job(client, book, name)
             if not job_id:
                 kind, payload = await self._torrent_payload(book, source, settings)
                 tag = f"narratarr-{book_id}"
+                # A route may set its own label and save path; otherwise the client's own apply.
                 job_id = await client.add(
-                    kind, payload, tag, downloaders.category_for(settings, name), downloaders.folder_for(settings, name)
+                    kind, payload, tag, decision.label or entry.category, decision.save_path or entry.save_path
                 )
                 db.update(book_id, download_client=name, client_job_id=job_id, info_hash=book["info_hash"] or job_id)
 
@@ -552,9 +630,9 @@ class Worker:
             folder = await self._wait_for_client(client, book_id, job_id, settings)
             if wanted.kind_of(book) == "ebook":
                 if not ebooks.ebook_files(folder):
-                    raise ValueError("The torrent finished, but there's no ebook in it.")
+                    raise bad_release(ValueError("The torrent finished, but there's no ebook in it."))
             elif not (folder.is_file() and folder.suffix.lower() in media.AUDIO_TYPES) and not media.audio_files(folder):
-                raise ValueError("The torrent finished, but there are no audio files in it.")
+                raise bad_release(ValueError("The torrent finished, but there are no audio files in it."))
             tmp = self._fresh_tmp(book, settings)
             db.update(book_id, detail="Copying files from the torrent…")
             await self._in_thread(book_id, link_into, folder, tmp)
@@ -566,12 +644,12 @@ class Worker:
         started = time.monotonic()
         while True:
             if time.monotonic() - started > CLIENT_TIMEOUT_SECONDS:
-                raise ClientError(f"{client.label} hasn't finished this download in a week. It may have no seeds.")
+                raise bad_release(ClientError(f"{client.label} hasn't finished this download in a week. It may have no seeds."))
             job = await client.job(job_id)
             if job is None:
                 raise ClientError(f"{client.label} no longer has this download. It may have been removed there.")
             if job.state == "failed":
-                raise ClientError(job.error or f"{client.label} couldn't finish this download.")
+                raise bad_release(ClientError(job.error or f"{client.label} couldn't finish this download."))
             if job.state == "completed":
                 folder = mapped_path(job.path, settings)
                 if not job.path or not folder.exists():
@@ -617,7 +695,7 @@ class Worker:
                 return
             db.update(book_id, progress=state["progress"], speed=state["speed"], detail=state["detail"])
             if time.monotonic() - started > RD_TIMEOUT_SECONDS:
-                raise TimeoutError(f"Timed out waiting for {cloud.label}. The torrent may have no seeders.")
+                raise bad_release(TimeoutError(f"Timed out waiting for {cloud.label}. The torrent may have no seeders."))
             await asyncio.sleep(POLL_SECONDS)
 
     async def _download(self, book_id: int, files: list[dict], tmp: Path) -> None:
@@ -675,7 +753,7 @@ class Worker:
         """Keep the best ebook file from the download, filed next to its audiobook if the library has one."""
         pick = ebooks.best(await asyncio.to_thread(ebooks.ebook_files, tmp))
         if pick is None:
-            raise ValueError("The download finished, but there's no ebook in it.")
+            raise bad_release(ValueError("The download finished, but there's no ebook in it."))
         folder = unique_destination(book, settings)
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / f"{safe_name(book['title'], 'Untitled')}{pick.suffix.lower()}"

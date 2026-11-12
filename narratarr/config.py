@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -78,17 +79,50 @@ class Settings:
     # Look for Wanted books on Prowlarr (and LibriVox) every few hours.
     auto_search: bool = True
     auto_search_hours: int = 12
+    # A release that searching finds on its own waits under Awaiting approval instead of downloading.
+    found_needs_approval: bool = False
+    # When a download fails because of the release itself (a dead torrent, a failed repair, no audio in
+    # it), look for another release of the book and take that instead, like Sonarr and Radarr do.
+    retry_failed_downloads: bool = True
     audible_region: str = "us"
+    audible_extra_regions: list[str] = field(default_factory=list)  # more Audible stores people can search
     check_updates: bool = True  # one request a day to GitHub's releases API
+    # On by default, and on for an existing settings file that predates the key: `load()` starts
+    # from the dataclass defaults and only overwrites keys it finds, so an absent key means True.
+    ratings_enabled: bool = True
+    # Audible storefronts Audnex serves, in the order they are tried. `br` is not here: the API
+    # rejects it as an unsupported code, and a code that can only fail should not be offered.
+    audnex_regions: list[str] = field(default_factory=lambda: ["uk"])
     auth_local_bypass: bool = False  # skip sign-in for requests from this machine and the home network
     listener_approval: bool = True  # a listener's request waits for an admin before anything is searched or downloaded
     languages: str = ""  # the languages books should be in, e.g. "German, English" (blank: any)
+
+    # Download clients, as a list. Empty means "not migrated yet": `load()` builds it from the flat
+    # settings above the first time, so an existing install keeps working untouched.
+    clients: list = field(default_factory=list)
+    default_client: str = ""  # the client a grab falls through to when no route matches
+    # Ordered routing rules, versioned so a future format change is a migration and not a repair.
+    client_routes: dict = field(default_factory=lambda: {"version": 1, "rules": []})
 
     def public(self) -> dict:
         """Settings safe to send to the browser (secrets masked)."""
         d = asdict(self)
         for key in SECRETS:
             d[key] = _mask(d[key], key)
+        from .downloaders import entry_from_dict
+
+        d["clients"] = []
+        for c in (asdict(self).get("clients") or []):
+            if not isinstance(c, dict):
+                continue
+            parsed = entry_from_dict(c)
+            d["clients"].append({
+                **c,
+                "label": parsed.label if parsed else c.get("type", ""),
+                "configured": bool(parsed and parsed.configured),
+                "password": _mask(c.get("password", ""), "x_password"),
+                "api_key": _mask(c.get("api_key", ""), "x_api_key"),
+            })
         d["rd_configured"] = bool(self.rd_api_key)
         d["ad_configured"] = bool(self.ad_api_key)
         d["tb_configured"] = bool(self.tb_api_key)
@@ -102,10 +136,17 @@ class Settings:
         d["qbittorrent_configured"] = bool(self.qbittorrent_url)
         d["transmission_configured"] = bool(self.transmission_url)
         d["deluge_configured"] = bool(self.deluge_url)
-        d["usenet_configured"] = d[f"{self.usenet_client}_configured"]
+        # A client in the list is what "configured" means now; the flat settings remain the answer
+        # for an install that has not been migrated or was set up through the older API.
+        from .downloaders import entries
+
+        listed = entries(self)
+        d["usenet_configured"] = any(e.delivery == "usenet" and e.configured for e in listed) \
+            or d[f"{self.usenet_client}_configured"]
         short = {"realdebrid": "rd", "alldebrid": "ad", "torbox": "tb", "premiumize": "pm"}.get(self.torrent_client,
                                                                                                  self.torrent_client)
-        d["torrent_configured"] = d[f"{short}_configured"]
+        d["torrent_configured"] = any(e.delivery == "torrent" and e.configured for e in listed) \
+            or d[f"{short}_configured"]
         return d
 
 
@@ -157,16 +198,27 @@ def load() -> Settings:
                 for old, new in RENAMED.items():
                     if old in raw and new not in raw:
                         raw[new] = raw[old]
-                known = {f.name for f in fields(Settings)}
+                known = {f.name: f for f in fields(Settings)}
                 for k, v in raw.items():
                     if k in known:
-                        setattr(_settings, k, v)
+                        setattr(_settings, k, as_bool(v) if isinstance(known[k].default, bool) else v)
+            migrate_clients(_settings)
         return _settings
+
+
+def as_bool(v) -> bool:
+    """A switch's value. Older pages sent a ticked box as "on", which was saved as text; read it as on."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "on", "yes")
+    return bool(v)
 
 
 def update(changes: dict) -> Settings:
     """Apply changes and persist. Masked secrets sent back unchanged are ignored."""
     s = load()
+    list_given = "clients" in changes
+    prev_default = s.default_client
+    touched_flat = any(k in _FLAT_PROTOCOL_FIELDS[p] for k in changes for p in _FLAT_PROTOCOL_FIELDS)
     with _lock:
         known = {f.name: f for f in fields(Settings)}
         fresh = {k for k, v in changes.items() if k in SECRETS and isinstance(v, str) and v and not v.startswith("•")}
@@ -175,6 +227,8 @@ def update(changes: dict) -> Settings:
                 continue
             if k in SECRETS and isinstance(v, str) and v.startswith("•"):
                 continue
+            if isinstance(known[k].default, bool):
+                v = as_bool(v)
             if k in SERVICE_SECRETS and isinstance(v, str):
                 v = v.strip().rstrip("/")
                 if v and not v.startswith(("http://", "https://")):
@@ -183,6 +237,18 @@ def update(changes: dict) -> Settings:
                     for secret in SERVICE_SECRETS[k]:
                         if secret not in fresh:
                             setattr(s, secret, "")
+            if k == "audnex_regions":
+                v = parse_regions(v)
+            elif k == "audible_extra_regions":
+                v = parse_audible_stores(v)
+            elif k == "clients":
+                v = _merge_client_secrets(validate_clients(v), s.clients)
+            elif k == "client_routes":
+                from . import routing
+
+                v = routing.validate(v, s)
+            elif k == "default_client":
+                v = str(v or "").strip().lower()
             if k == "max_concurrent":
                 v = max(1, min(int(v), 8))
             elif k == "auto_search_hours":
@@ -203,6 +269,33 @@ def update(changes: dict) -> Settings:
                 if ".." in v.split("/"):
                     raise ValueError("The folder layout has to stay inside the library folder.")
             setattr(s, k, v)
+        if touched_flat and not list_given:
+            refresh_clients(s)  # a caller still using the flat fields
+        # A removed client must not leave the default pointing at nothing.
+        ids = [c["id"] for c in s.clients]
+        if s.default_client not in ids:
+            s.default_client = ids[0] if ids else ""
+        from .downloaders import DELIVERY
+
+        flat_for = {"usenet": "usenet_client", "torrent": "torrent_client"}
+        if s.default_client != prev_default and "default_client" in changes:
+            # Picking a default is picking the client for its protocol, which is what the flat choice
+            # records and what the rest of the app (and routing's fall-through) reads.
+            kind = next((c["type"] for c in s.clients if c["id"] == s.default_client), "")
+            flat = flat_for.get(DELIVERY.get(kind, ""))
+            if flat and kind in CHOICES[flat]:
+                setattr(s, flat, kind)
+        elif "default_client" not in changes:
+            # And the other way round: choosing a client the old way (connecting AllDebrid, or
+            # PUT {"torrent_client": ...}) makes it the default when the default was that protocol's.
+            for proto, flat in flat_for.items():
+                if flat not in changes:
+                    continue
+                current = next((c for c in s.clients if c["id"] == s.default_client), None)
+                if current is None or DELIVERY.get(current["type"]) == proto:
+                    pick = next((c["id"] for c in s.clients if c["type"] == getattr(s, flat)), "")
+                    if pick:
+                        s.default_client = pick
         if s.import_folder:
             lib, imp = Path(s.library_dir).expanduser().resolve(), Path(s.import_folder).expanduser().resolve()
             if lib == imp or lib in imp.parents or imp in lib.parents:
@@ -210,6 +303,208 @@ def update(changes: dict) -> Settings:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         _write_private(SETTINGS_FILE, json.dumps(asdict(s), indent=2))
     return s
+
+
+def parse_audible_stores(value) -> list[str]:
+    """The extra Audible stores people may search, in the admin's order. Codes from CHOICES["audible_region"]."""
+    if isinstance(value, str):
+        raw = [x for x in re.split(r"[,\s]+", value.strip()) if x]
+    elif isinstance(value, (list, tuple)):
+        raw = [str(x).strip() for x in value if str(x).strip()]
+    else:
+        raw = []
+    out: list[str] = []
+    for code in raw:
+        code = code.lower()
+        if code not in CHOICES["audible_region"]:
+            raise ValueError(f"'{code}' isn't an Audible store. Use one of: {', '.join(CHOICES['audible_region'])}.")
+        if code not in out:
+            out.append(code)
+    return out
+
+
+AUDNEX_REGIONS = ("us", "uk", "ca", "au", "in", "de", "fr", "it", "es", "jp")
+
+
+def parse_regions(value) -> list[str]:
+    """An ordered, de-duplicated list of storefront codes, or a ValueError naming the bad one.
+
+    The order is the user's: availability is per item, so the list is a search order, not a set.
+    A code the API does not serve is refused here rather than saved and quietly 400-ing later.
+    """
+    if isinstance(value, str):
+        raw = [x for x in re.split(r"[,\s]+", value.strip()) if x]
+    elif isinstance(value, (list, tuple)):
+        raw = [str(x).strip() for x in value if str(x).strip()]
+    else:
+        raw = []
+    out: list[str] = []
+    for code in raw:
+        code = code.lower()
+        if code not in AUDNEX_REGIONS:
+            raise ValueError(
+                f"'{code}' isn't an Audible storefront Audnex serves. Use one of: {', '.join(AUDNEX_REGIONS)}.")
+        if code not in out:
+            out.append(code)
+    return out or ["uk"]
+
+
+# ---- download clients: one flat configuration per protocol, migrated into a list ------------
+
+_FLAT = {
+    "sabnzbd": ("sabnzbd_url", "sabnzbd_api_key", "sabnzbd_category", ""),
+    "nzbget": ("nzbget_url", "nzbget_password", "nzbget_category", ""),
+    "qbittorrent": ("qbittorrent_url", "qbittorrent_password", "qbittorrent_category", "qbittorrent_folder"),
+    "transmission": ("transmission_url", "transmission_password", "transmission_label", "transmission_folder"),
+    "deluge": ("deluge_url", "deluge_password", "", "deluge_folder"),
+}
+_DEBRID_KEYS = {"realdebrid": "rd_api_key", "alldebrid": "ad_api_key", "torbox": "tb_api_key", "premiumize": "pm_api_key"}
+
+
+def _flat_entry(kind: str, s: Settings) -> dict:
+    """The one client a flat setting describes, in the list's shape."""
+    if kind in _DEBRID_KEYS:
+        return {"id": kind, "type": kind, "api_key": getattr(s, _DEBRID_KEYS[kind], "")}
+    url_key, secret_key, category_key, folder_key = _FLAT[kind]
+    entry = {"id": kind, "type": kind, "url": getattr(s, url_key, "")}
+    if secret_key:
+        # NBZGet, qBittorrent, Transmission and Deluge all authenticate differently; put the value
+        # where that client's own constructor reads it.
+        if kind == "sabnzbd":
+            entry["api_key"] = getattr(s, secret_key, "")
+        else:
+            entry["password"] = getattr(s, secret_key, "")
+        if kind in ("nzbget", "qbittorrent", "transmission"):
+            entry["username"] = getattr(s, f"{kind}_username", "")
+    if category_key:
+        entry["category"] = getattr(s, category_key, "")
+    if folder_key:
+        entry["save_path"] = getattr(s, folder_key, "")
+    return entry
+
+
+def migrate_clients(s: Settings) -> None:
+    """Build the client list from the flat settings, once, when there is no list yet.
+
+    One entry per protocol that is actually configured, because a working setup can have SABnzbd for
+    Usenet and qBittorrent for torrents at the same time, and a single entry would silently drop
+    one of them. That is the upgrade promise: every value is carried over, nothing is dropped.
+    """
+    if s.clients:
+        return
+    from .downloaders import entry_from_dict
+
+    made: list[dict] = []
+    for kind in (s.usenet_client, s.torrent_client):
+        if not kind:
+            continue
+        entry = _flat_entry(kind, s)
+        parsed = entry_from_dict(entry)
+        if parsed is None or not parsed.configured:
+            continue  # nothing configured for this protocol: do not invent an empty client
+        made.append(entry)
+    s.clients = made
+    if made:
+        torrent = next((e["id"] for e in made if e["id"] not in ("sabnzbd", "nzbget")), "")
+        s.default_client = torrent or made[0]["id"]
+
+
+# ---- the compatibility path, and when it can go ----------------------------------------------
+#
+# The flat client fields (`torrent_client`, `qbittorrent_url`, …) are still part of the settings
+# model and of the public API: `PUT /api/settings {"torrent_client": "deluge"}` is a documented way
+# to change where downloads go. Settings no longer renders them, but anything that still sets them
+# has to keep working, so a flat client change is mirrored into the list.
+#
+# It goes when the flat fields themselves go. That is a separate change: delete them from Settings,
+# teach the migration to read the old file's keys directly, and move the callers over.
+
+_FLAT_PROTOCOL_FIELDS = {
+    "usenet": ("usenet_client", "sabnzbd_url", "sabnzbd_api_key", "sabnzbd_category",
+               "nzbget_url", "nzbget_username", "nzbget_password", "nzbget_category"),
+    "torrent": ("torrent_client", "rd_api_key", "ad_api_key", "tb_api_key", "pm_api_key",
+                "qbittorrent_url", "qbittorrent_username", "qbittorrent_password",
+                "qbittorrent_category", "qbittorrent_folder",
+                "transmission_url", "transmission_username", "transmission_password",
+                "transmission_label", "transmission_folder",
+                "deluge_url", "deluge_password", "deluge_folder"),
+}
+
+
+def refresh_clients(s: Settings) -> None:
+    """Mirror a flat client change into the list, for callers that still use the flat fields."""
+    from .downloaders import entry_from_dict
+
+    current = {c.get("id"): c for c in (s.clients or []) if isinstance(c, dict)}
+    for kind in (s.usenet_client, s.torrent_client):
+        if not kind:
+            continue
+        entry = _flat_entry(kind, s)
+        parsed = entry_from_dict(entry)
+        if parsed is None:
+            continue
+        if entry["id"] in current:
+            current[entry["id"]] = {**current[entry["id"]], **entry}
+        elif parsed.configured:
+            current[entry["id"]] = entry
+    s.clients = list(current.values())
+    ids = [c["id"] for c in s.clients]
+    if s.default_client not in ids:
+        torrent = next((c for c in ids if c not in ("sabnzbd", "nzbget")), "")
+        s.default_client = torrent or (ids[0] if ids else "")
+
+
+def validate_clients(value) -> list:
+    """A list of client records, ids unique, types ones we can actually build."""
+    from .downloaders import DELIVERY
+
+    if isinstance(value, str):  # the settings form posts hidden inputs as text
+        try:
+            value = json.loads(value or "[]")
+        except ValueError:
+            raise ValueError("clients has to be a list of download clients")
+    if not isinstance(value, list):
+        raise ValueError("clients has to be a list of download clients")
+    out, seen = [], set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ValueError("each download client has to be an object")
+        kind = str(raw.get("type") or "").strip().lower()
+        if kind not in DELIVERY:
+            raise ValueError(f"'{kind or 'no type'}' isn't a download client Narratarr can talk to.")
+        cid = str(raw.get("id") or kind).strip().lower() or kind
+        if cid in seen:
+            raise ValueError(f"two clients share the id '{cid}'")
+        seen.add(cid)
+        entry = {k: (v if isinstance(v, str) else "") for k, v in raw.items() if isinstance(v, str)}
+        entry.update({"id": cid, "type": kind})
+        for field_name in ("url", "username", "password", "api_key", "category", "save_path"):
+            entry.setdefault(field_name, "")
+        if entry["url"]:
+            url = entry["url"].rstrip("/")
+            if not url.startswith(("http://", "https://")):
+                raise ValueError(f"The {entry['id']} address must start with http:// or https://")
+            entry["url"] = url
+        out.append(entry)
+    return out
+
+
+def _merge_client_secrets(new: list, old: list) -> list:
+    """A masked secret posted back unchanged means "leave it alone", exactly as flat secrets do.
+
+    And, exactly as flat secrets do, a saved password or key only ever stays with the machine it was
+    entered for: if the client's address now points at a different host, or the entry has become a
+    different kind of client, a masked secret is dropped rather than carried over. Otherwise changing
+    an address would send the old password to the new machine on the next Test or grab.
+    """
+    by_id = {c.get("id"): c for c in old if isinstance(c, dict)}
+    for entry in new:
+        prev = by_id.get(entry["id"]) or {}
+        same_place = prev.get("type") == entry.get("type") and _host(prev.get("url", "")) == _host(entry.get("url", ""))
+        for key in ("password", "api_key"):
+            if str(entry.get(key) or "").startswith("•"):
+                entry[key] = prev.get(key, "") if same_place else ""
+    return new
 
 
 def _host(url: str) -> str:

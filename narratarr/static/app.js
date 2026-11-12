@@ -49,6 +49,7 @@ const state = {
   sources: [],
   library: [],
   libraryKey: "",
+  libRatings: { at: 0, ratings: {} },
   discover: { q: "", category: "", page: 0, total: 1, items: [], loading: false, error: "", token: 0, dym: "", lang: "", fmt: "", sort: "", note: "", source: lastSource(), kind: lastKind() },
   libFilter: "all",
   libFormat: "",
@@ -239,6 +240,9 @@ async function bookAction(id, action) {
     const out = await api(`/api/library/${id}?delete_files=${!!res.files}`, { method: "DELETE" });
     toast(out?.kept ? `Removed. Its files were kept at ${out.kept}` : takeBack ? "Request taken back" : decline ? "Request declined" : "Removed from library",
       out?.kept ? { kind: "ok" } : {});
+  } else if (action === "keep-looking") {
+    const book = await api(`/api/library/${id}/keep-looking`, { method: "POST" });
+    toast(`Turned that release down. Still looking for ${book.title}`, { kind: "ok", cover: book.cover_url });
   } else if (action === "approve") {
     const book = await api(`/api/library/${id}/approve`, { method: "POST" });
     toast(book.status === "queued" ? `Approved. ${book.title} is downloading` : `Approved. Looking for ${book.title} now`, { kind: "ok", cover: book.cover_url });
@@ -288,7 +292,10 @@ async function refreshLibrary() {
 function updateRdPill() {
   const pill = $("#rd-pill");
   const st = state.settings || {};
-  const ready = [st.torrent_configured && CLIENTS[st.torrent_client], st.usenet_configured && CLIENTS[st.usenet_client]].filter(Boolean);
+  // Name the clients the list actually holds, not the flat setting it replaced.
+  const ready = (st.clients || []).filter((c) => c.configured).map((c) => c.label)
+    .concat([st.torrent_configured && !(st.clients || []).length && CLIENTS[st.torrent_client],
+             st.usenet_configured && !(st.clients || []).length && CLIENTS[st.usenet_client]]).filter(Boolean);
   pill.className = `rd-pill ${ready.length ? "ok" : "missing"}`;
   $("span", pill).textContent = ready.length ? `${ready.join(" · ")} ready` : "Connect a downloader";
 }
@@ -338,16 +345,51 @@ function cardHTML(item, lib, i = 0) {
     <article class="card" tabindex="0" data-url="${esc(item.url)}" ${lib ? `data-id="${lib.id}"` : ""} style="--glow:hsl(${h} 80% 55%);animation-delay:${Math.min(i, 12) * 35}ms">
       <div class="cover-wrap">
         ${coverHTML(item)}
-        ${stBadge(lib)}
+        ${!lib && item.abs ? `<span class="st-badge ok">${I.check}In Audiobookshelf</span>` : stBadge(lib)}
         ${active ? `<div class="bar"><i style="width:${lib.progress || 0}%"></i></div>` : ""}
-        ${quickButton(item, lib)}
+        ${!lib && item.abs ? "" : quickButton(item, lib)}
       </div>
       <div class="meta">
         <div class="title">${esc(item.title)}</div>
         <div class="author">${esc(item.author || (item.indexer ? `via ${item.indexer}` : "Unknown author"))}</div>
         ${facts.length ? `<div class="facts">${facts.map((f) => `<span>${esc(f)}</span>`).join("")}</div>` : ""}
+        ${ratingPillHTML(item)}
+        ${clientChip(item)}
       </div>
     </article>`;
+}
+
+function ratingPillHTML(item) {
+  // `rating` is whatever provider Settings selected. `label` is the small mark beside the score:
+  // the source mark beside the score, e.g. "Audible".
+  // Switched off in Settings: no slot, no words. "Absent" is not "unrated".
+  if (item.rating_state === "off") return "";
+  const r = item.rating;
+  let inner = "";
+  if (r && (r.score_text || r.display)) {
+    const score = r.score_text || `★ ${Number(r.R).toFixed(1)}`;
+    const second = r.label || (r.count ? `${r.count}` : "");
+    const tip = r.tooltip || r.display || "";
+    inner = `<a class="rating-pill" href="${esc(r.url)}" target="_blank" rel="noopener" title="${esc(tip)}">
+        <span class="rating-score">${esc(score)}</span>
+        ${second ? `<span class="rating-mark">${esc(second)}</span>` : ""}
+      </a>`;
+  } else {
+    // Two different facts, so two different strings. "The source knows this book and nobody has
+    // rated it" is information; "we never found it" is not the same thing.
+    inner = `<span class="rating-pill empty">${item.rating_state === "unrated" ? "No Rating Available" : "No Rating"}</span>`;
+  }
+  // Always emit the slot so every card reserves the same space and the row
+  // sits at the same height whether or not a rating exists.
+  return `<div class="rating-slot">${inner}</div>`;
+}
+
+function clientChip(item) {
+  // Which client takes this result if you grab it. Re-resolved at grab time, because a rule can
+  // change between seeing a row and clicking it.
+  const c = item.client;
+  if (!c || !c.label) return "";
+  return `<div class="client-chip" title="This release would go to ${esc(c.label)}${c.rule === null ? " (no rule matched, so the default)" : ""}">${esc(c.label)}</div>`;
 }
 
 const shortLength = (len) => (len || "").replace(/ hours?/, "h").replace(/ and /, " ").replace(/ minutes?/, "m");
@@ -511,7 +553,8 @@ function Discover(root) {
     <div id="dym"></div>
     <div id="lang-note"></div>
     <div class="grid" id="grid"></div>
-    <div class="load-more" id="sentinel"></div>`;
+    <div class="load-more" id="sentinel"></div>
+  `;
 
   const grid = $("#grid", root);
   const sentinel = $("#sentinel", root);
@@ -521,9 +564,9 @@ function Discover(root) {
     $("#disc-title", root).innerHTML = d.q
       ? `Results for <em style="font-style:italic">“${esc(d.q)}”</em> <span class="in-src">in ${esc(src.label)}${src.name === "prowlarr" && d.kind === "ebook" ? " · ebooks" : ""}</span>`
       : esc(cat ? cat.name : defaultLabel);
-    $("#dym", root).innerHTML = d.dym
+    $("#dym", root).innerHTML = (d.dym
       ? `<p class="dym">Including results for <em>${esc(d.dym)}</em> · <button data-literal>Show only close matches for “${esc(d.q)}”</button></p>`
-      : "";
+      : "") + (d.storeNote ? `<p class="dym">${esc(d.storeNote)}</p>` : "");
     refine();
   }
 
@@ -534,14 +577,24 @@ function Discover(root) {
     // The unsorted order is whatever the source gave us: relevance, popularity or recency.
     const listedNewest = !d.q && (["torrent", "indexer"].includes(src.delivery) || d.category === "new");
     const natural = d.q ? "Best match" : listedNewest ? "Newest first" : "Most popular";
-    const sorts = [["", natural], ["newest", "Newest first"], ["largest", "Largest"], ["smallest", "Smallest"], ["title", "Title A–Z"]]
+    const sorts = [["", natural], ["rating", "Rating"], ["newest", "Newest first"], ["largest", "Largest"], ["smallest", "Smallest"], ["title", "Title A–Z"]]
       .filter(([v]) => !(v === "newest" && listedNewest));
     const shown = visibleItems().length;
-    $("#refine", root).innerHTML = !d.items.length ? "" : `
+    $("#refine", root).innerHTML = !d.items.length ? storePicker() : `
       <span class="muted">${shown}${shown !== d.items.length ? ` of ${d.items.length}` : ""} books</span>
       <select class="select" data-r="lang" aria-label="Language">${opts(d.items.map((i) => i.language), d.lang, "All languages")}</select>
       <select class="select" data-r="fmt" aria-label="Format">${opts(d.items.map((i) => i.format.toUpperCase()), d.fmt, "All formats")}</select>
-      <select class="select" data-r="sort" aria-label="Sort">${sorts.map(([v, l]) => `<option value="${v}" ${v === d.sort ? "selected" : ""}>${l}</option>`).join("")}</select>`;
+      <select class="select" data-r="sort" aria-label="Sort">${sorts.map(([v, l]) => `<option value="${v}" ${v === d.sort ? "selected" : ""}>${l}</option>`).join("")}</select>`
+      + storePicker();
+  }
+
+  // The Audible catalog can be searched in the other stores an admin turned on.
+  function storePicker() {
+    const stores = src.name === "audible" ? audibleStores() : [];
+    if (stores.length < 2) return "";
+    const cur = d.store || d.storeUsed || stores[0];
+    return `<select class="select" data-store-pick aria-label="Audible store">${stores.map((v) =>
+      `<option value="${v}" ${v === cur ? "selected" : ""}>${esc(storeName(v))} store</option>`).join("")}</select>`;
   }
 
   const sizeOf = (s) => {
@@ -553,6 +606,7 @@ function Discover(root) {
     let items = d.items.filter((i) => (!d.lang || i.language === d.lang) && (!d.fmt || i.format.toUpperCase() === d.fmt))
       .filter((i) => d.allLangs || i.lang_ok !== false);
     const by = {
+      rating: (a, b) => { const s = (x) => x.rating?.score ?? null; const av = s(a), bv = s(b); if (av == null && bv == null) return 0; if (av == null) return 1; if (bv == null) return -1; return bv - av; },
       newest: (a, b) => (Date.parse(b.posted) || 0) - (Date.parse(a.posted) || 0),
       largest: (a, b) => sizeOf(b.size) - sizeOf(a.size),
       smallest: (a, b) => sizeOf(a.size) - sizeOf(b.size),
@@ -598,7 +652,7 @@ function Discover(root) {
   async function load(reset) {
     if (d.loading && !reset) return;
     const token = ++d.token;
-    if (reset) { d.items = []; d.page = 0; d.total = 1; d.error = ""; d.dym = ""; d.note = ""; grid.innerHTML = skeletons(12); }
+    if (reset) { d.items = []; d.page = 0; d.total = 1; d.error = ""; d.dym = ""; d.note = ""; d.storeNote = ""; grid.innerHTML = skeletons(12); }
     d.loading = true;
     heading();
     footer();
@@ -610,13 +664,15 @@ function Discover(root) {
     try {
       const params = new URLSearchParams({ q: d.q, category: d.category, page: d.page + 1, source: d.source });
       if (src.name === "prowlarr") params.set("kind", d.kind);
+      if (src.name === "audible" && d.store) params.set("region", d.store);
+      if (d.sort === "rating") params.set("sort", "rating");
       const res = await api(`/api/discover?${params}`);
       if (token !== d.token) return;
       const seen = new Set(d.items.map((i) => i.url));
       d.items.push(...res.items.filter((i) => !seen.has(i.url)));
       d.page = res.page;
       d.total = res.total_pages;
-      if (reset) { d.dym = res.did_you_mean || ""; d.note = res.note || ""; }
+      if (reset) { d.dym = res.did_you_mean || ""; d.note = res.note || ""; d.storeUsed = res.region || ""; d.storeNote = res.region_note || ""; }
     } catch (e) {
       if (token !== d.token) return;
       d.error = e.message;
@@ -688,6 +744,10 @@ function Discover(root) {
   input.addEventListener("search", () => { if (!input.value && d.q) search(""); });
 
   $("#refine", root).onchange = (e) => {
+    if (e.target.matches("[data-store-pick]")) {
+      d.store = e.target.value === audibleStores()[0] ? "" : e.target.value;
+      return load(true);
+    }
     const r = e.target.dataset.r;
     if (!r) return;
     d[r] = e.target.value;
@@ -828,7 +888,7 @@ function libCardHTML(b, i) {
     : ebook ? `<a class="quick" href="/api/library/${b.id}/ebook" download aria-label="Download the ebook of ${esc(b.title)}" title="Download ebook">${I.down}</a>`
     : `<button class="quick play-quick" data-play="${b.id}" aria-label="Play ${esc(b.title)}" title="Play">${I.play}</button>`;
   const facts = listening ? [ebook ? readLeft(b) : fmtLeft(b.listen_duration - b.listen_position)]
-    : b.status === "requested" ? [b.requested_by_name ? `Asked by ${b.requested_by_name}` : "Awaiting approval"]
+    : b.status === "requested" ? [b.found_by_search ? "Found a release: awaiting approval" : b.requested_by_name ? `Asked by ${b.requested_by_name}` : "Awaiting approval"]
     : b.status === "wanted" ? [b.last_searched ? `Looked ${ago(b.last_searched)}` : "Not looked for yet"]
     : b.status === "failed" ? [(b.error || "Couldn’t download").slice(0, 70)]
     : active ? [b.status === "queued" ? "Waiting for a free slot" : b.detail || STATUS[b.status]]
@@ -848,8 +908,30 @@ function libCardHTML(b, i) {
         <div class="title">${esc(b.title)}</div>
         <div class="author">${esc(b.author || "Unknown author")}</div>
         <div class="facts ${b.status === "failed" ? "bad" : ""}">${facts.filter(Boolean).map((f) => `<span>${esc(f)}</span>`).join("")}</div>
+        ${libRatingHTML(b)}
       </div>
     </article>`;
+}
+
+// The same rating pill as Discover (PR #14, curator8888), for the books that have one. Unlike
+// Discover there's no "No Rating" placeholder: a shelf of imported books would be a wall of them.
+function libRatingHTML(b) {
+  const r = state.libRatings.ratings[b.id];
+  return r ? ratingPillHTML({ rating: r, rating_state: "rated" }) : "";
+}
+
+// Asked once per visit to the Library, never with the two-second refresh. Resolves true when the
+// pills changed, so the page knows to draw them.
+async function loadLibRatings() {
+  const was = state.libRatings;
+  if (Date.now() - was.at < 5 * 60 * 1000) return false;
+  try {
+    const res = await api("/api/library/ratings");
+    state.libRatings = { at: Date.now(), ratings: res.ratings || {} };
+  } catch {
+    return false;
+  }
+  return JSON.stringify(state.libRatings.ratings) !== JSON.stringify(was.ratings);
 }
 
 function continueListening() {
@@ -912,6 +994,22 @@ function requestsTrayHTML() {
         const picked = !isCatalog(b.source);
         const what = picked ? `picked “${esc(b.release || b.title)}”${b.size ? ` · ${esc(b.size)}` : ""}`
           : admin ? "no release picked: approving starts the search" : "any good release";
+        if (b.found_by_search) {
+          return `
+        <div class="req-row" data-id="${b.id}">
+          ${coverHTML(b)}
+          <div class="req-copy">
+            <b>${esc(b.title)}</b> <span class="req-by">· ${esc(firstAuthor(b.author) || "Unknown author")}</span>${isEbook(b) ? ` <span class="kind-inline">${I.book}Ebook</span>` : ""}
+            <small>Automatic search found “${esc(b.release || b.title)}”${b.size ? ` · ${esc(b.size)}` : ""} · ${esc(ago(b.updated_at))}${b.requested_by_name ? ` · wanted by ${esc(b.requested_by_name)}` : ""}</small>
+          </div>
+          <div class="req-actions">${admin ? `
+            <button class="btn primary sm" data-act="approve">${I.check} Approve</button>
+            <button class="btn sm" data-act="releases">Pick another</button>
+            <button class="btn sm ghost" data-act="keep-looking">Keep looking</button>`
+            : `<button class="btn sm ghost danger" data-act="remove" data-mine>Take back</button>`}
+          </div>
+        </div>`;
+        }
         return `
         <div class="req-row" data-id="${b.id}">
           ${coverHTML(b)}
@@ -1032,7 +1130,7 @@ function Library(root) {
     render();
   };
   root.onclick = async (e) => {
-    if (e.target.closest("a.quick")) return; // an ebook download: let the link do it
+    if (e.target.closest("a.quick, a.rating-pill")) return; // an ebook download or a rating's page: let the link do it
     if (e.target.closest("#import-btn, [data-import]")) return openImport();
     const row = e.target.closest(".req-row");
     const act = e.target.closest("[data-act]");
@@ -1058,6 +1156,7 @@ function Library(root) {
 
   let listenSig = "";
   render();
+  loadLibRatings().then((changed) => { if (changed && root.isConnected) render(); });
   return {
     update(structural) {
       const sig = state.library.map((b) => `${b.id}:${b.finished}:${Math.round(b.listen_position / 60)}`).join("|");
@@ -1721,10 +1820,11 @@ function AuthorDetail(root, id) {
     if (!data) return;
     const books = data.books.map((b) => ({ ...b, source: "audible", posted: b.released }));
     const have = books.filter((b) => libFor(b));
-    const missing = books.length - have.length;
+    const onShelf = books.filter((b) => !libFor(b) && b.abs).length;  // already in Audiobookshelf
+    const missing = books.length - have.length - onShelf;
     const mine = [...new Map(have.map((b) => [libFor(b).id, libFor(b)])).values()];  // one per library book
     $("#a-stats", root).innerHTML = [
-      ["ok", mine.filter((b) => b.status === "completed").length, "In your library"],
+      ["ok", mine.filter((b) => b.status === "completed").length + onShelf, "In your library"],
       ["info", mine.filter((b) => b.status !== "completed").length, "Wanted or downloading"],
       ["", missing, "Not added yet"],
     ].map(([tone, n, l]) => `<div class="hstat ${tone}"><b>${n}</b><span>${l}</span></div>`).join("");
@@ -1743,13 +1843,13 @@ function AuthorDetail(root, id) {
     const ordered = [...groups.entries()].sort(([a], [b]) => (a === "") - (b === ""));
     $("#a-books", root).innerHTML = books.length ? ordered.map(([name, list]) => {
       if (name) list.sort((a, b) => seq(a) - seq(b));
-      const owned = list.filter((b) => libFor(b)?.status === "completed").length;
-      const notYet = list.filter((b) => !libFor(b)).length;
+      const owned = list.filter((b) => libFor(b)?.status === "completed" || (!libFor(b) && b.abs)).length;
+      const notYet = list.filter((b) => !libFor(b) && !b.abs).length;
       return `
       <section class="book-group">
         <div class="section-head"><h2>${esc(name || (groups.size > 1 ? "Standalones and others" : "Books"))}</h2>
           <span class="muted">${owned} of ${list.length} in your library${notYet ? ` · ${notYet} not added yet` : ""}</span></div>
-        <div class="grid">${list.map((b, i) => cardHTML(b, libFor(b), i).replace('class="card"', `class="card${libFor(b) ? "" : " missing"}"`)).join("")}</div>
+        <div class="grid">${list.map((b, i) => cardHTML(b, libFor(b), i).replace('class="card"', `class="card${libFor(b) || b.abs ? "" : " missing"}"`)).join("")}</div>
       </section>`;
     }).join("") : `<div class="empty"><h3>No books yet</h3><p>Audible doesn't list any books here yet.</p></div>`;
     root._books = books;
@@ -2004,6 +2104,15 @@ const LAYOUT_VARS = [
   ["series", "The series name"], ["series_number", "The book's number in its series, like 1 or 2.5"], ["year", "The year it came out"],
 ];
 // The languages offered under Settings → Search & sources (as narratarr/languages.py COMMON).
+const AUDIBLE_STORES = [["us", "United States"], ["uk", "United Kingdom"], ["ca", "Canada"], ["au", "Australia"], ["in", "India"],
+  ["de", "Germany"], ["fr", "France"], ["it", "Italy"], ["es", "Spain"], ["jp", "Japan"]];
+const storeName = (code) => (AUDIBLE_STORES.find(([v]) => v === code) || [code, code.toUpperCase()])[1];
+// The Audible stores people can search: the main one first, then the ones an admin added.
+function audibleStores() {
+  const main = state.settings?.audible_region || "us";
+  return [main, ...(state.settings?.audible_extra_regions || []).filter((r) => r !== main)];
+}
+
 const LANGUAGES = ["English", "German", "French", "Spanish", "Italian", "Dutch", "Portuguese", "Polish", "Swedish", "Danish",
   "Norwegian", "Finnish", "Czech", "Hungarian", "Russian", "Japanese", "Chinese", "Korean"];
 
@@ -2075,7 +2184,10 @@ function settingsStatus(key, users, notifiers) {
     return on.length ? [`${on.join(" · ")} connected`, "ok"] : ["No indexer connected", ""];
   }
   if (key === "downloads") {
-    const ready = [st.torrent_configured && CLIENTS[st.torrent_client], st.usenet_configured && CLIENTS[st.usenet_client]].filter(Boolean);
+    // Name the clients the list actually holds, not the flat setting it replaced.
+  const ready = (st.clients || []).filter((c) => c.configured).map((c) => c.label)
+    .concat([st.torrent_configured && !(st.clients || []).length && CLIENTS[st.torrent_client],
+             st.usenet_configured && !(st.clients || []).length && CLIENTS[st.usenet_client]]).filter(Boolean);
     return ready.length ? [ready.join(" · "), "ok"] : ["Set up a download client", "warn"];
   }
   if (key === "abs") return st.audiobookshelf_url && st.audiobookshelf_token ? ["Connected", "ok"] : ["Not connected", ""];
@@ -2092,30 +2204,6 @@ function settingsStatus(key, users, notifiers) {
 }
 
 // Signing in to a cloud service with a short code: AllDebrid's PIN, TorBox's device code.
-function codeCardHTML(p, name, where, url) {
-  return `<div class="pin-card" id="${p}-pin-card">
-    <div class="pin-start" id="${p}-pin-start">
-      <div><b id="${p}-pin-title"></b><p class="desc" id="${p}-pin-desc"></p></div>
-      <div class="pin-actions">
-        <button class="btn" type="button" data-${p}-test>Test</button>
-        <button class="btn" type="button" id="${p}-pin">Connect ${name}</button>
-      </div>
-    </div>
-    <div class="pin-wait" id="${p}-pin-wait" hidden>
-      <span class="pin-code" id="${p}-pin-code" aria-label="Your code"></span>
-      <div class="pin-steps">
-        <b>Enter this code on ${name}</b>
-        <p class="desc">Open the page below wherever you’re signed in to ${name}, even on your phone. This page carries on by itself once you have.</p>
-        <div class="pin-actions">
-          <a class="btn" id="${p}-pin-link" href="${url}" target="_blank" rel="noopener noreferrer">Open ${where}</a>
-          <button class="btn ghost" type="button" id="${p}-pin-cancel">Cancel</button>
-        </div>
-        <small class="pin-status"><span class="spinner" aria-hidden="true"></span><span id="${p}-pin-left">Waiting for the code…</span></small>
-      </div>
-    </div>
-  </div>`;
-}
-
 function Settings(root, page) {
   const s = state.settings || {};
   const tile = (client, label, where) => {
@@ -2175,9 +2263,11 @@ function Settings(root, page) {
           <div><h3>Tidy your library</h3><p class="desc">Move the books already in your library into this layout, using their details from Audible or their own tags. You see every change first, and can undo it.</p></div>
           <div class="tidy-btns">
             <button class="btn ghost" type="button" id="tidy-undo" hidden>${I.retry} Undo last tidy</button>
+            <button class="btn" type="button" id="tidy-fill">${I.search} Fill in missing details</button>
             <button class="btn primary" type="button" id="tidy-open">Preview changes</button>
           </div>
         </div>
+        <div class="body"><span class="hint" id="tidy-fill-note">Books whose tags don’t say their series, narrator or year come out as singles. <b>Fill in missing details</b> asks Audible for them, book by book, and only takes a book whose title and author match exactly. Nothing is moved or overwritten. Fix any single book with Edit details.</span></div>
         <div class="body" id="tidy-gate" hidden><span class="hint">${I.alert} Save your library folder and layout first, so the preview uses them.</span></div>
       </section>
 
@@ -2333,182 +2423,21 @@ function Settings(root, page) {
       </section>
 
       <section class="panel" data-page="downloads">
-        <div class="ph"><h3>Torrents</h3><p class="desc">Real-Debrid, AllDebrid, TorBox and Premiumize fetch them for you, so nothing is shared from your computer. qBittorrent, Transmission and Deluge download on your own machine and keep seeding, which shows your IP address to other peers; many people run them behind a VPN.</p></div>
+        <div class="ph"><h3>Download clients</h3><p class="desc">What fetches your books. Real-Debrid, AllDebrid, TorBox and Premiumize fetch torrents for you, so nothing is shared from your computer. qBittorrent, Transmission and Deluge download on your own machine and keep seeding, which shows your IP address to other peers; many people run them behind a VPN. SABnzbd and NZBGet take the Usenet results Prowlarr finds.</p></div>
         <div class="body">
-          <div class="tile-groups" data-choice="torrent_client" role="radiogroup" aria-label="Download torrents with">
-            <div class="tile-group"><span class="tile-label" aria-hidden="true">In the cloud</span>
-              <div class="choice-tiles">${tile("realdebrid", "Real-Debrid", "Premium account")}${tile("alldebrid", "AllDebrid", "Premium account")}${tile("torbox", "TorBox", "TorBox account")}${tile("premiumize", "Premiumize", "Premium account")}</div></div>
-            <div class="tile-group"><span class="tile-label" aria-hidden="true">On this machine</span>
-              <div class="choice-tiles">${tile("qbittorrent", "qBittorrent", "Seeds from here")}${tile("transmission", "Transmission", "Seeds from here")}${tile("deluge", "Deluge", "Seeds from here")}</div></div>
-          </div>
-          <input type="hidden" name="torrent_client" value="${esc(s.torrent_client)}" />
-          <div class="client-fields" data-for="torrent_client:realdebrid">
-            <div class="field">
-              <label for="rd_api_key">Real-Debrid API key</label>
-              <div class="input-row">
-                <input class="input mono" id="rd_api_key" name="rd_api_key" type="password" placeholder="Paste your private API token" value="${esc(s.rd_api_key)}" />
-                <button class="btn" type="button" id="test-rd">Test</button>
-              </div>
-              <span class="hint">Find it at <a href="https://real-debrid.com/apitoken" target="_blank" rel="noopener" style="color:var(--accent)">real-debrid.com/apitoken</a>.</span>
-            </div>
-            <div id="rd-result"></div>
-            <label class="switch"><input type="checkbox" name="delete_from_rd_after" ${s.delete_from_rd_after ? "checked" : ""}><i></i>Remove torrents from Real-Debrid after downloading</label>
-          </div>
-          <div class="client-fields" data-for="torrent_client:alldebrid">
-            ${codeCardHTML("ad", "AllDebrid", "alldebrid.com/pin", "https://alldebrid.com/pin/")}
-            <div id="ad-result"></div>
-            <details class="set-more">
-              <summary>Use an API key instead</summary>
-              <div class="field">
-                <label for="ad_api_key">AllDebrid API key</label>
-                <div class="input-row">
-                  <input class="input mono" id="ad_api_key" name="ad_api_key" type="password" placeholder="Paste an API key" value="${esc(s.ad_api_key)}" />
-                  <button class="btn" type="button" data-ad-test>Test</button>
-                </div>
-                <span class="hint">Create one at <a href="https://alldebrid.com/apikeys" target="_blank" rel="noopener" style="color:var(--accent)">alldebrid.com/apikeys</a>.</span>
-              </div>
-            </details>
-            <label class="switch"><input type="checkbox" name="delete_from_ad_after" ${s.delete_from_ad_after ? "checked" : ""}><i></i>Remove torrents from AllDebrid after downloading</label>
-          </div>
-          <div class="client-fields" data-for="torrent_client:torbox">
-            ${codeCardHTML("tb", "TorBox", "TorBox’s sign-in page", "https://torbox.app/")}
-            <div id="tb-result"></div>
-            <details class="set-more">
-              <summary>Use an API key instead</summary>
-              <div class="field">
-                <label for="tb_api_key">TorBox API key</label>
-                <div class="input-row">
-                  <input class="input mono" id="tb_api_key" name="tb_api_key" type="password" placeholder="Paste an API key" value="${esc(s.tb_api_key)}" />
-                  <button class="btn" type="button" data-tb-test>Test</button>
-                </div>
-                <span class="hint">Find it in TorBox under <a href="https://torbox.app/settings" target="_blank" rel="noopener" style="color:var(--accent)">Settings → API key</a>.</span>
-              </div>
-            </details>
-            <label class="switch"><input type="checkbox" name="delete_from_tb_after" ${s.delete_from_tb_after ? "checked" : ""}><i></i>Remove torrents from TorBox after downloading</label>
-          </div>
-          <div class="client-fields" data-for="torrent_client:premiumize">
-            <div class="field">
-              <label for="pm_api_key">Premiumize API key</label>
-              <div class="input-row">
-                <input class="input mono" id="pm_api_key" name="pm_api_key" type="password" placeholder="Paste your API key" value="${esc(s.pm_api_key)}" />
-                <button class="btn" type="button" id="test-pm">Test</button>
-              </div>
-              <span class="hint">Find it at <a href="https://www.premiumize.me/account" target="_blank" rel="noopener" style="color:var(--accent)">premiumize.me/account</a>.</span>
-            </div>
-            <div id="pm-result"></div>
-            <label class="switch"><input type="checkbox" name="delete_from_pm_after" ${s.delete_from_pm_after ? "checked" : ""}><i></i>Remove torrents and their files from Premiumize after downloading</label>
-          </div>
-          <div class="client-fields" data-for="torrent_client:qbittorrent">
-            <div class="field">
-              <label for="qbittorrent_url">qBittorrent Web UI address</label>
-              <div class="input-row">
-                <input class="input mono" id="qbittorrent_url" name="qbittorrent_url" placeholder="http://localhost:8080" value="${esc(s.qbittorrent_url)}" />
-                <button class="btn" type="button" data-test-client="qbittorrent">Test</button>
-              </div>
-              <div data-result="qbittorrent"></div>
-            </div>
-            <div class="set-grid three">
-              <div class="field"><label for="qbittorrent_username">Username</label><input class="input mono" id="qbittorrent_username" name="qbittorrent_username" value="${esc(s.qbittorrent_username)}" autocomplete="off" /></div>
-              <div class="field"><label for="qbittorrent_password">Password</label><input class="input mono" id="qbittorrent_password" name="qbittorrent_password" type="password" value="${esc(s.qbittorrent_password)}" /></div>
-              <div class="field"><label for="qbittorrent_category">Category</label><input class="input mono" id="qbittorrent_category" name="qbittorrent_category" value="${esc(s.qbittorrent_category)}" /></div>
-            </div>
-            <div class="field">
-              <label for="qbittorrent_folder">Download folder</label>
-              <input class="input mono" id="qbittorrent_folder" name="qbittorrent_folder" placeholder="qBittorrent’s default" value="${esc(s.qbittorrent_folder)}" />
-              <span class="hint">Optional. Where qBittorrent saves Narratarr’s books, as qBittorrent sees it, e.g. <code>/data/torrents/books</code>. Keeps them apart from your other downloads.</span>
-            </div>
-          </div>
-          <div class="client-fields" data-for="torrent_client:transmission">
-            <div class="field">
-              <label for="transmission_url">Transmission address</label>
-              <div class="input-row">
-                <input class="input mono" id="transmission_url" name="transmission_url" placeholder="http://localhost:9091" value="${esc(s.transmission_url)}" />
-                <button class="btn" type="button" data-test-client="transmission">Test</button>
-              </div>
-              <div data-result="transmission"></div>
-            </div>
-            <div class="set-grid">
-              <div class="field"><label for="transmission_username">Username</label><input class="input mono" id="transmission_username" name="transmission_username" value="${esc(s.transmission_username)}" autocomplete="off" placeholder="If you set one" /></div>
-              <div class="field"><label for="transmission_password">Password</label><input class="input mono" id="transmission_password" name="transmission_password" type="password" value="${esc(s.transmission_password)}" /></div>
-            </div>
-            <div class="field">
-              <label for="transmission_label">Label</label>
-              <input class="input mono" id="transmission_label" name="transmission_label" value="${esc(s.transmission_label)}" />
-              <span class="hint">Optional. Added to every torrent Narratarr sends, so you can filter them in Transmission 3.0 or later.</span>
-            </div>
-            <div class="field">
-              <label for="transmission_folder">Download folder</label>
-              <input class="input mono" id="transmission_folder" name="transmission_folder" placeholder="Transmission’s default" value="${esc(s.transmission_folder)}" />
-              <span class="hint">Optional. Where Transmission saves Narratarr’s books, as Transmission sees it, e.g. <code>/data/torrents/books</code>. Keeps them apart from your other downloads.</span>
-            </div>
-          </div>
-          <div class="client-fields" data-for="torrent_client:deluge">
-            <div class="field">
-              <label for="deluge_url">Deluge Web UI address</label>
-              <div class="input-row">
-                <input class="input mono" id="deluge_url" name="deluge_url" placeholder="http://localhost:8112" value="${esc(s.deluge_url)}" />
-                <button class="btn" type="button" data-test-client="deluge">Test</button>
-              </div>
-              <div data-result="deluge"></div>
-            </div>
-            <div class="field">
-              <label for="deluge_password">Password</label>
-              <input class="input mono" id="deluge_password" name="deluge_password" type="password" value="${esc(s.deluge_password)}" />
-              <span class="hint">Deluge’s web password (it has no username). Set it under Preferences → Interface → Password.</span>
-            </div>
-            <div class="field">
-              <label for="deluge_folder">Download folder</label>
-              <input class="input mono" id="deluge_folder" name="deluge_folder" placeholder="Deluge’s default" value="${esc(s.deluge_folder)}" />
-              <span class="hint">Optional. Where Deluge saves Narratarr’s books, as Deluge sees it, e.g. <code>/data/torrents/books</code>. Keeps them apart from your other downloads.</span>
-            </div>
-          </div>
+          <div id="client-list" class="client-list"></div>
+          <div class="tile-groups client-picker" id="client-picker" hidden></div>
+          <div><button class="btn" type="button" id="add-client">${I.plus}Add a client</button></div>
         </div>
       </section>
 
       <section class="panel" data-page="downloads">
-        <div class="ph ph-row">
-          <div><h3>Usenet</h3><p class="desc">For the Usenet results Prowlarr finds.</p></div>
-          <div class="segmented" data-choice="usenet_client" role="radiogroup" aria-label="Download Usenet releases with">
-            <button type="button" role="radio" data-v="sabnzbd">SABnzbd</button>
-            <button type="button" role="radio" data-v="nzbget">NZBGet</button>
-          </div>
-        </div>
+        <div class="ph"><h3>Routing</h3><p class="desc">Send releases from some indexers, or of one kind of book, to a particular client. Rules are checked top to bottom and the first match decides. With no rules, everything goes to the default client.</p></div>
         <div class="body">
-          <input type="hidden" name="usenet_client" value="${esc(s.usenet_client)}" />
-          <div class="client-fields" data-for="usenet_client:sabnzbd">
-            <div class="set-grid">
-              <div class="field"><label for="sabnzbd_url">SABnzbd address</label><input class="input mono" id="sabnzbd_url" name="sabnzbd_url" placeholder="http://localhost:8080" value="${esc(s.sabnzbd_url)}" /></div>
-              <div class="field">
-                <label for="sabnzbd_api_key">API key</label>
-                <div class="input-row">
-                  <input class="input mono" id="sabnzbd_api_key" name="sabnzbd_api_key" type="password" placeholder="Config → General → API Key" value="${esc(s.sabnzbd_api_key)}" />
-                  <button class="btn" type="button" data-test-client="sabnzbd">Test</button>
-                </div>
-              </div>
-            </div>
-            <div data-result="sabnzbd"></div>
-            <div class="field">
-              <label for="sabnzbd_category">Category</label>
-              <input class="input mono" id="sabnzbd_category" name="sabnzbd_category" placeholder="audiobooks" value="${esc(s.sabnzbd_category)}" style="max-width:240px" />
-              <span class="hint">Optional. Must already exist in SABnzbd. Leave it empty to use its default.</span>
-            </div>
-          </div>
-          <div class="client-fields" data-for="usenet_client:nzbget">
-            <div class="field">
-              <label for="nzbget_url">NZBGet address</label>
-              <div class="input-row">
-                <input class="input mono" id="nzbget_url" name="nzbget_url" placeholder="http://localhost:6789" value="${esc(s.nzbget_url)}" />
-                <button class="btn" type="button" data-test-client="nzbget">Test</button>
-              </div>
-              <div data-result="nzbget"></div>
-            </div>
-            <div class="set-grid three">
-              <div class="field"><label for="nzbget_username">Username</label><input class="input mono" id="nzbget_username" name="nzbget_username" value="${esc(s.nzbget_username)}" placeholder="nzbget" autocomplete="off" /></div>
-              <div class="field"><label for="nzbget_password">Password</label><input class="input mono" id="nzbget_password" name="nzbget_password" type="password" value="${esc(s.nzbget_password)}" /></div>
-              <div class="field"><label for="nzbget_category">Category</label><input class="input mono" id="nzbget_category" name="nzbget_category" placeholder="Audiobooks" value="${esc(s.nzbget_category)}" /></div>
-            </div>
-            <span class="hint">The username and password are NZBGet’s ControlUsername and ControlPassword (Settings → Security).</span>
-          </div>
+          <div id="route-list"></div>
+          <div id="route-coverage" class="hint"></div>
+          <div><button class="btn" type="button" id="add-route">${I.plus}Add a rule</button>
+            <span class="hint" style="margin-left:10px">A rule with no indexer picked applies to every indexer.</span></div>
         </div>
       </section>
 
@@ -2551,11 +2480,44 @@ function Settings(root, page) {
             </div>
           </div>
           <div class="set-row">
+            <label class="switch"><input type="checkbox" name="found_needs_approval" ${s.found_needs_approval ? "checked" : ""}><i></i><span><b>Ask before downloading what it finds</b><small>A release found for a Wanted book waits under Library → Awaiting approval, so you can check its language, format and size first. Approve it, pick another, or keep looking. Add the Release found event to a notification to hear about each one.</small></span></label>
+          </div>
+          <div class="set-row">
+            <label class="switch"><input type="checkbox" name="retry_failed_downloads" ${s.retry_failed_downloads ? "checked" : ""}><i></i><span><b>Try another release when a download fails</b><small>When the release itself is bad (a dead torrent, a failed repair, no audio in it), Narratarr picks the next best match instead, up to twice per book. Releases that failed are marked in Find releases and never picked on their own again. A setup problem, like a folder Narratarr can’t see, isn’t retried.</small></span></label>
+          </div>
+          <div class="set-row">
             <label for="audible_region"><b>Audible store for book details</b><small>Covers, series and release dates come from here. Nothing is downloaded from Audible.</small></label>
             <select class="select" id="audible_region" name="audible_region">
-              ${[["us", "United States"], ["uk", "United Kingdom"], ["ca", "Canada"], ["au", "Australia"], ["in", "India"], ["de", "Germany"], ["fr", "France"], ["it", "Italy"], ["es", "Spain"], ["jp", "Japan"]]
+              ${AUDIBLE_STORES
                 .map(([v, l]) => `<option value="${v}" ${s.audible_region === v ? "selected" : ""}>${l}</option>`).join("")}
             </select>
+          </div>
+          <div class="field">
+            <label><b>More Audible stores to search</b></label>
+            <input type="hidden" name="audible_extra_regions" id="audible_extra_regions" value="${esc((s.audible_extra_regions || []).join(", "))}" />
+            <div class="lang-chips" id="store-chips" role="group" aria-label="More Audible stores">
+              ${AUDIBLE_STORES.filter(([v]) => v !== (s.audible_region || "us")).map(([v, l]) => {
+                const on = (s.audible_extra_regions || []).includes(v);
+                return `<button type="button" class="fpill ${on ? "on" : ""}" data-store="${v}" aria-pressed="${on}">${l}</button>`;
+              }).join("")}
+            </div>
+            <span class="hint">Books that are only sold in another country, such as French titles on audible.fr, can be found there. Everyone, listeners too, can switch the Audible catalog to these stores for a search, and a search that finds nothing in your main store tries them in this order.</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" data-page="search">
+        <div class="ph"><h3>Rating metadata</h3><p class="desc">The star pill on every Discover card. Ratings are read from a local cache, never fetched while a page loads: a book with no rating yet is filled in the background and appears on your next search.</p></div>
+        <div class="body">
+          <div class="field">
+            <label class="switch"><input type="checkbox" name="ratings_enabled" ${s.ratings_enabled ? "checked" : ""}><i></i>Show ratings on book cards</label>
+            <span class="hint">A star score from Audible’s own average, for any book they sell. Ratings are read from a local cache, never fetched while a page loads, so a new book fills in the background and shows next time. Switching this off removes the pill from every card and makes no network requests at all.</span>
+          </div>
+          <div class="set-row">
+            <label><b>Audible storefronts</b><small>A book is only sold in some countries, and the ratings service only answers from a country that sells it. Narratarr asks your list in order, then the country the book itself came from, so the single United Kingdom entry is enough for most titles. The storefront that answered is remembered for that book. Add more only if the same cards keep showing <b>No Rating</b>: more regions means more coverage and more requests.</small></label>
+            <div id="audnex-regions"></div>
+            <input type="hidden" name="audnex_regions" value="${esc((s.audnex_regions || ["uk"]).join(","))}" />
+            <div><button class="btn" type="button" id="add-region">Add a region</button></div>
           </div>
         </div>
       </section>
@@ -2625,7 +2587,7 @@ function Settings(root, page) {
               <input class="input mono" id="audiobookshelf_url" name="audiobookshelf_url" placeholder="Empty to search, or an IP or domain" value="${esc(s.audiobookshelf_url)}" />
               <button class="btn" type="button" id="abs-find">${I.search} Find</button>
             </div>
-            <span class="hint">Empty: looks on this computer, in Docker, then across your home network. With an address (a LAN or public IP, or a domain): finds Audiobookshelf there, trying https first.</span>
+            <span class="hint">Empty: looks on this computer, in Docker, then across your home network. With an address (a LAN or public IP, or a domain): finds Audiobookshelf there, trying https first. If Narratarr runs in Docker, use the IP address of the machine Audiobookshelf runs on, not localhost.</span>
             <div id="abs-found"></div>
           </div>
 
@@ -2724,6 +2686,16 @@ function Settings(root, page) {
     input.setSelectionRange(at + text.length, at + text.length);
     input.dispatchEvent(new Event("input", { bubbles: true }));
   }));
+  $("#store-chips", root).onclick = (e) => {
+    const b = e.target.closest("[data-store]");
+    if (!b) return;
+    const on = b.getAttribute("aria-pressed") !== "true";
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", String(on));
+    form.audible_extra_regions.value = $$("[data-store][aria-pressed=true]", root).map((x) => x.dataset.store).join(", ");
+    form.audible_extra_regions.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
   $("#lang-chips", root).onclick = (e) => {
     const b = e.target.closest("[data-lang]");
     if (!b) return;
@@ -2777,10 +2749,485 @@ function Settings(root, page) {
     $$(`[data-for^="${group}:"]`, root).forEach((el) => { el.hidden = el.dataset.for !== `${group}:${v}`; });
     dirty();
   };
+  // ---- download clients, as a list ---------------------------------------------------------
+  // Rendered rather than hand-written markup: nine types with different fields each, and the
+  // routing table reads this same list. The payload goes back as JSON in hidden inputs, which is
+  // what the settings form already posts.
+  const clientBox = $("#client-list", root);
+  const routeBox = $("#route-list", root);
+  const coverageBox = $("#route-coverage", root);
+  const TYPE_LABEL = { sabnzbd: "SABnzbd", nzbget: "NZBGet", qbittorrent: "qBittorrent", transmission: "Transmission",
+    deluge: "Deluge", realdebrid: "Real-Debrid", alldebrid: "AllDebrid", torbox: "TorBox", premiumize: "Premiumize" };
+  const GROUPS = [
+    ["In the cloud", [["realdebrid", "Premium account"], ["alldebrid", "Premium account"], ["torbox", "TorBox account"], ["premiumize", "Premium account"]]],
+    ["On this machine", [["qbittorrent", "Seeds from here"], ["transmission", "Seeds from here"], ["deluge", "Seeds from here"]]],
+    ["Usenet", [["sabnzbd", "Usenet"], ["nzbget", "Usenet"]]],
+  ];
+  const WHERE = Object.fromEntries(GROUPS.flatMap(([, list]) => list));
+  const link = (href, text) => `<a href="${href}" target="_blank" rel="noopener" style="color:var(--accent)">${text}</a>`;
+  // What each type needs, in the order a person fills it in: [field, label, placeholder, hint].
+  const FIELDS = {
+    sabnzbd: [["url", "SABnzbd address", "http://localhost:8080"], ["api_key", "API key", "Config → General → API Key"],
+      ["category", "Category", "audiobooks", "Optional. Must already exist in SABnzbd. Leave it empty to use its default."]],
+    nzbget: [["url", "NZBGet address", "http://localhost:6789"], ["username", "Username", "nzbget"], ["password", "Password"],
+      ["category", "Category", "Audiobooks", "The username and password are NZBGet’s ControlUsername and ControlPassword (Settings → Security)."]],
+    qbittorrent: [["url", "qBittorrent Web UI address", "http://localhost:8080"], ["username", "Username"], ["password", "Password"],
+      ["category", "Category", "audiobooks"],
+      ["save_path", "Download folder", "qBittorrent’s default", "Optional. Where qBittorrent saves Narratarr’s books, as qBittorrent sees it, e.g. <code>/data/torrents/books</code>."]],
+    transmission: [["url", "Transmission address", "http://localhost:9091"], ["username", "Username", "If you set one"], ["password", "Password"],
+      ["category", "Label", "", "Optional. Added to every torrent Narratarr sends, so you can filter them in Transmission 3.0 or later."],
+      ["save_path", "Download folder", "Transmission’s default", "Optional. Where Transmission saves Narratarr’s books, as Transmission sees it."]],
+    deluge: [["url", "Deluge Web UI address", "http://localhost:8112"],
+      ["password", "Password", "", "Deluge’s web password (it has no username). Set it under Preferences → Interface → Password."],
+      ["save_path", "Download folder", "Deluge’s default", "Optional. Where Deluge saves Narratarr’s books, as Deluge sees it."]],
+    realdebrid: [["api_key", "Real-Debrid API key", "Paste your private API token", `Find it at ${link("https://real-debrid.com/apitoken", "real-debrid.com/apitoken")}.`]],
+    alldebrid: [["api_key", "AllDebrid API key", "Paste an API key", `Create one at ${link("https://alldebrid.com/apikeys", "alldebrid.com/apikeys")}.`]],
+    torbox: [["api_key", "TorBox API key", "Paste an API key", `Find it in TorBox under ${link("https://torbox.app/settings", "Settings → API key")}.`]],
+    premiumize: [["api_key", "Premiumize API key", "Paste your API key", `Find it at ${link("https://www.premiumize.me/account", "premiumize.me/account")}.`]],
+  };
+  const DELETE_AFTER = {
+    realdebrid: ["delete_from_rd_after", "Remove torrents from Real-Debrid after downloading"],
+    alldebrid: ["delete_from_ad_after", "Remove torrents from AllDebrid after downloading"],
+    torbox: ["delete_from_tb_after", "Remove torrents from TorBox after downloading"],
+    premiumize: ["delete_from_pm_after", "Remove torrents and their files from Premiumize after downloading"],
+  };
+  // AllDebrid and TorBox can connect with a short code entered on their site instead of a pasted key.
+  const PIN = {
+    alldebrid: { site: "alldebrid.com", where: "alldebrid.com/pin", start: "/api/settings/alldebrid/pin", check: "/api/settings/alldebrid/pin/check" },
+    torbox: { site: "TorBox", where: "TorBox’s sign-in page", start: "/api/settings/torbox/code", check: "/api/settings/torbox/code/check" },
+  };
+  const deleteAfter = Object.fromEntries(Object.values(DELETE_AFTER).map(([name]) => [name, Boolean(s[name])]));
+  let clients = [];
+  let routes = [];
+  let advertised = [];
+  let defaultClient = s.default_client || "";
+  let defaults = { torrent: "", usenet: "" };  // where a release no rule matches goes, per protocol
+  const DELIVERY = { sabnzbd: "usenet", nzbget: "usenet" };
+  const deliveryOf = (c) => DELIVERY[c.type] || "torrent";
+
+  const hidden = (name, value) => {
+    // Inside the form, not the panel: save() posts FormData(form) and would never see it otherwise.
+    let input = form.querySelector(`input[type=hidden][name=${name}]`);
+    if (!input) { input = document.createElement("input"); input.type = "hidden"; input.name = name; form.appendChild(input); }
+    input.value = value;
+  };
+  const sync = () => {
+    hidden("clients", JSON.stringify(clients));
+    hidden("client_routes", JSON.stringify({ version: 1, rules: routes }));
+    hidden("default_client", defaultClient);
+    dirty();
+  };
+  const clientName = (c) => esc(TYPE_LABEL[c.type] || c.type) + (c.id === c.type ? "" : ` · ${esc(c.id)}`);
+  const hasKey = (c) => Boolean(c.api_key);
+
+  const fieldHTML = (c, [k, label, placeholder = "", hint = ""]) => `
+    <div class="field">
+      <label>${label}</label>
+      <input class="input mono" data-f="${k}" type="${k === "password" || k === "api_key" ? "password" : "text"}"
+             value="${esc(c[k] || "")}" placeholder="${esc(placeholder)}" autocomplete="off" />
+      ${hint ? `<span class="hint">${hint}</span>` : ""}
+    </div>`;
+
+  const pinHTML = (c) => {
+    const on = hasKey(c);
+    const name = TYPE_LABEL[c.type];
+    return `<div class="pin-card">
+      <div class="pin-start" data-pin-start>
+        <div><b>${on ? `${name} is connected` : "Connect with a code"}</b>
+          <p class="desc">${on ? "Test checks the account. To use a different one, connect again."
+            : `Narratarr shows a short code, you enter it on ${PIN[c.type].site}, and you’re connected. There’s no key to copy, and your password never comes here.`}</p></div>
+        <div class="pin-actions"><button class="btn ${on ? "" : "primary"}" type="button" data-act="pin">${on ? "Connect again" : `Connect ${name}`}</button></div>
+      </div>
+      <div class="pin-wait" data-pin-wait hidden>
+        <span class="pin-code" data-pin-code aria-label="Your code"></span>
+        <div class="pin-steps">
+          <b>Enter this code on ${name}</b>
+          <p class="desc">Open the page below wherever you’re signed in to ${name}, even on your phone. This page carries on by itself once you have.</p>
+          <div class="pin-actions">
+            <a class="btn" data-pin-link href="#" target="_blank" rel="noopener noreferrer">Open ${PIN[c.type].where}</a>
+            <button class="btn ghost" type="button" data-act="pin-cancel">Cancel</button>
+          </div>
+          <small class="pin-status"><span class="spinner" aria-hidden="true"></span><span data-pin-left>Waiting for the code…</span></small>
+        </div>
+      </div>
+    </div>`;
+  };
+
+  const drawClients = () => {
+    const firstOfType = new Set();
+    clientBox.innerHTML = clients.length ? clients.map((c, i) => {
+      const fields = FIELDS[c.type] || [];
+      const own = fields.filter(([k]) => ["url", "username", "password", "api_key"].includes(k));
+      const extra = fields.filter(([k]) => ["category", "save_path"].includes(k));
+      const del = DELETE_AFTER[c.type] && !firstOfType.has(c.type) ? DELETE_AFTER[c.type] : null;
+      firstOfType.add(c.type);
+      return `
+      <div class="client-card" data-i="${i}">
+        <div class="client-head">
+          <span class="client-name"><b>${clientName(c)}</b>
+            <small>${esc(WHERE[c.type] || "")}</small></span>
+          <span class="client-tools">
+            ${defaults[deliveryOf(c)] === c.id
+              ? `<span class="client-default" title="Releases no routing rule matches go here">${I.check}Default for ${deliveryOf(c) === "usenet" ? "Usenet" : "torrents"}</span>`
+              : clients.filter((x) => deliveryOf(x) === deliveryOf(c)).length > 1 ? `<button class="btn sm ghost" type="button" data-act="default">Make default</button>` : ""}
+            <button class="btn sm" type="button" data-act="test">Test</button>
+            <button class="btn sm ghost icon danger" type="button" data-act="remove" aria-label="Remove ${clientName(c)}">${I.trash}</button>
+          </span>
+        </div>
+        ${PIN[c.type] ? pinHTML(c) : ""}
+        ${PIN[c.type] ? `<details class="set-more"${hasKey(c) ? "" : ""}><summary>Use an API key instead</summary>
+            <div class="set-grid">${own.map((f) => fieldHTML(c, f)).join("")}</div></details>`
+          : `<div class="set-grid ${own.length > 2 ? "three" : ""}">${own.map((f) => fieldHTML(c, f)).join("")}</div>`}
+        ${extra.length ? `<div class="set-grid">${extra.map((f) => fieldHTML(c, f)).join("")}</div>` : ""}
+        ${del ? `<label class="switch"><input type="checkbox" name="${del[0]}" ${deleteAfter[del[0]] ? "checked" : ""}><i></i>${del[1]}</label>` : ""}
+        <div data-out></div>
+      </div>`;
+    }).join("") : `<p class="muted client-empty">No download client yet. Add the one you already use.</p>`;
+  };
+  // Until the server says otherwise, a protocol's default is its first client.
+  const fillDefaults = () => {
+    for (const proto of ["torrent", "usenet"]) {
+      const mine = clients.filter((c) => deliveryOf(c) === proto);
+      if (!mine.some((c) => c.id === defaults[proto])) defaults[proto] = mine[0]?.id || "";
+    }
+  };
+
+  const drawRoutes = () => {
+    routeBox.innerHTML = routes.map((r, i) => {
+      const named = r.match.indexers || [];
+      // Indexers a rule names that this install no longer advertises still show, so they can be removed.
+      const offer = [...new Set([...advertised, ...named])];
+      return `
+      <div class="route-card" data-i="${i}">
+        <div class="route-head">
+          <b><span class="route-num">${i + 1}</span>${i === 0 ? "Checked first" : `Then rule ${i + 1}`}</b>
+          <span class="client-tools">
+            <button class="btn sm ghost icon" type="button" data-act="up" ${i === 0 ? "disabled" : ""} aria-label="Move rule ${i + 1} up">↑</button>
+            <button class="btn sm ghost icon" type="button" data-act="down" ${i === routes.length - 1 ? "disabled" : ""} aria-label="Move rule ${i + 1} down">↓</button>
+            <button class="btn sm" type="button" data-act="test">Test</button>
+            <button class="btn sm ghost icon danger" type="button" data-act="remove" aria-label="Remove rule ${i + 1}">${I.trash}</button>
+          </span>
+        </div>
+        <div class="field">
+          <label>From</label>
+          <div class="lang-chips" role="group" aria-label="Indexers rule ${i + 1} matches">
+            ${offer.map((n) => `<button type="button" class="fpill ${named.includes(n) ? "on" : ""}" data-ix="${esc(n)}" aria-pressed="${named.includes(n)}">${esc(n)}</button>`).join("")}
+          </div>
+          <span class="hint">${named.length ? "Only releases from these." : "None picked: releases from any indexer."}</span>
+        </div>
+        <div class="set-grid">
+          <div class="field"><label>Kind of book</label><select class="select" data-f="categories">
+            ${[["", "Any"], ["audiobook", "Audiobooks"], ["ebook", "Ebooks"]].map(([v, l]) =>
+              `<option value="${v}" ${((r.match.categories || [])[0] || "") === v ? "selected" : ""}>${l}</option>`).join("")}
+          </select></div>
+          <div class="field"><label>Send to</label><select class="select" data-f="client">
+            ${clients.map((c) => `<option value="${esc(c.id)}" ${r.client === c.id ? "selected" : ""}>${clientName(c)}</option>`).join("")}
+          </select></div>
+        </div>
+        <details class="set-more"${r.label || r.save_path ? " open" : ""}><summary>Category and folder for this rule</summary>
+          <div class="set-grid">
+            <div class="field"><label>Category or label</label><input class="input mono" data-f="label" value="${esc(r.label || "")}" placeholder="the client’s own" /></div>
+            <div class="field"><label>Download folder</label><input class="input mono" data-f="save_path" value="${esc(r.save_path || "")}" placeholder="the client’s own" /></div>
+          </div>
+        </details>
+        <div data-out></div>
+      </div>`;
+    }).join("") || `<p class="muted client-empty">No rules yet: every release goes to the default client, exactly as before.</p>`;
+  };
+
+  clientBox.oninput = clientBox.onchange = (e) => {
+    const card = e.target.closest(".client-card");
+    if (!card) return;
+    const i = Number(card.dataset.i);
+    if (e.target.type === "checkbox" && e.target.name in deleteAfter) { deleteAfter[e.target.name] = e.target.checked; dirty(); return; }
+    const k = e.target.dataset.f;
+    if (k) { clients[i][k] = e.target.value; sync(); }
+  };
+
+  let pinTimer = 0;
+  const pinStop = (card) => {
+    clearTimeout(pinTimer);
+    if (!card) return;
+    $("[data-pin-wait]", card).hidden = true;
+    $("[data-pin-start]", card).hidden = false;
+  };
+  const pinConnect = async (btn, card, c) => {
+    const out = $("[data-out]", card);
+    const wait = $("[data-pin-wait]", card);
+    const name = TYPE_LABEL[c.type];
+    out.innerHTML = "";
+    spinBtn(btn, true);
+    let got;
+    try {
+      // Connecting saves the new key on the server, and the list is read back afterwards, so anything
+      // typed and not yet saved is saved first rather than lost.
+      if (saved && JSON.stringify(collect()) !== JSON.stringify(saved)) await save(true);
+      got = await api(PIN[c.type].start, { method: "POST" });
+    } catch (err) {
+      out.innerHTML = badLine(err.message);
+      spinBtn(btn, false);
+      return;
+    }
+    spinBtn(btn, false);
+    const code = got.pin || got.code;
+    $("[data-pin-code]", card).textContent = code;
+    $("[data-pin-link]", card).href = got.user_url;
+    $("[data-pin-start]", card).hidden = true;
+    wait.hidden = false;
+    const ends = Date.now() + got.expires_in * 1000;
+    const every = Math.max(3, got.interval || 3) * 1000;
+    const tick = async () => {
+      if (!wait.isConnected || wait.hidden) return; // cancelled, or left Settings
+      const left = Math.ceil((ends - Date.now()) / 60000);
+      if (left <= 0) {
+        pinStop(card);
+        out.innerHTML = badLine(`That code has expired. Choose Connect ${name} to get a new one.`);
+        return;
+      }
+      $("[data-pin-left]", card).textContent = `Waiting for the code · expires in ${left} min`;
+      try {
+        const r = await api(PIN[c.type].check, { method: "POST", body: got.pin ? { pin: code } : { code } });
+        if (!wait.isConnected || wait.hidden) return;
+        if (r.connected) {
+          pinStop(card);
+          state.settings = r.settings;
+          await loadRouting();
+          saved = snapshot();
+          dirty();
+          updateRdPill();
+          statuses();
+          const fresh = $$(".client-card", clientBox).find((el) => clients[Number(el.dataset.i)]?.type === c.type);
+          if (fresh) $("[data-out]", fresh).innerHTML = r.warning ? badLine(r.warning) : okLine(`${esc(name)} is connected`);
+          return;
+        }
+      } catch (err) {
+        pinStop(card);
+        out.innerHTML = badLine(err.message);
+        return;
+      }
+      pinTimer = setTimeout(tick, every);
+    };
+    pinTimer = setTimeout(tick, every);
+  };
+
+  clientBox.onclick = async (e) => {
+    const btn = e.target.closest("[data-act]");
+    if (!btn) return;
+    const card = btn.closest(".client-card");
+    const i = Number(card.dataset.i);
+    const out = $("[data-out]", card);
+    const act = btn.dataset.act;
+    if (act === "remove") { pinStop(); clients.splice(i, 1); fillDefaults(); drawClients(); drawRoutes(); sync(); return; }
+    if (act === "default") { defaultClient = clients[i].id; defaults[deliveryOf(clients[i])] = defaultClient; drawClients(); sync(); return; }
+    if (act === "pin") return pinConnect(btn, card, clients[i]);
+    if (act === "pin-cancel") return pinStop(card);
+    if (act === "test") {
+      spinBtn(btn, true);
+      try {
+        const got = await api("/api/settings/test-download-client", { method: "POST", body: { entry: clients[i] } });
+        out.innerHTML = okLine(got.summary ? esc(got.summary) : `Connected to ${esc(got.label)} ${esc(got.version || "")}`);
+      } catch (err) { out.innerHTML = badLine(err.message); }
+      spinBtn(btn, false);
+    }
+  };
+
+  // Adding a client: pick its kind from tiles, the way Downloads always looked.
+  const picker = $("#client-picker", root);
+  picker.innerHTML = GROUPS.map(([group, list]) => `
+    <div class="tile-group"><span class="tile-label" aria-hidden="true">${group}</span>
+      <div class="choice-tiles">${list.map(([t, where]) => `<button type="button" data-add="${t}"><b>${TYPE_LABEL[t]}</b><small>${where}</small></button>`).join("")}</div>
+    </div>`).join("");
+  $("#add-client", root).onclick = () => { picker.hidden = !picker.hidden; };
+  picker.onclick = (e) => {
+    const b = e.target.closest("[data-add]");
+    if (!b) return;
+    const type = b.dataset.add;
+    let id = type;
+    for (let n = 2; clients.some((c) => c.id === id); n++) id = `${type}-${n}`;
+    clients.push({ id, type, url: "", username: "", password: "", api_key: "", category: "", save_path: "" });
+    if (!defaultClient) defaultClient = id;
+    fillDefaults();
+    picker.hidden = true;
+    drawClients(); drawRoutes(); sync();
+    clientBox.lastElementChild?.querySelector("input:not([type=checkbox])")?.focus();
+  };
+
+  const readRoute = (row) => {
+    const i = Number(row.dataset.i);
+    const get = (k) => $(`[data-f=${k}]`, row);
+    const category = get("categories").value;
+    routes[i] = {
+      match: { indexers: $$(".fpill.on", row).map((b) => b.dataset.ix), categories: category ? [category] : [] },
+      client: get("client").value,
+      label: get("label").value,
+      save_path: get("save_path").value,
+    };
+    return i;
+  };
+
+  routeBox.onchange = routeBox.oninput = (e) => {
+    const row = e.target.closest(".route-card");
+    if (!row) return;
+    readRoute(row);
+    sync();
+  };
+
+  routeBox.onclick = async (e) => {
+    const pill = e.target.closest("[data-ix]");
+    if (pill) {
+      pill.classList.toggle("on");
+      pill.setAttribute("aria-pressed", pill.classList.contains("on"));
+      const row = pill.closest(".route-card");
+      readRoute(row);
+      $(".field .hint", row).textContent = routes[Number(row.dataset.i)].match.indexers.length
+        ? "Only releases from these." : "None picked: releases from any indexer.";
+      sync();
+      return;
+    }
+    const btn = e.target.closest("[data-act]");
+    if (!btn) return;
+    const row = btn.closest(".route-card");
+    const i = Number(row.dataset.i);
+    const act = btn.dataset.act;
+    if (act === "remove") { routes.splice(i, 1); drawRoutes(); sync(); return; }
+    if (act === "up" && i > 0) { [routes[i - 1], routes[i]] = [routes[i], routes[i - 1]]; drawRoutes(); sync(); return; }
+    if (act === "down" && i < routes.length - 1) { [routes[i + 1], routes[i]] = [routes[i], routes[i + 1]]; drawRoutes(); sync(); return; }
+    if (act === "test") {
+      const out = $("[data-out]", row);
+      readRoute(row);
+      sync();
+      spinBtn(btn, true);
+      try {
+        // The saved rules are what gets tested, so save first, as every other Test does.
+        await save(true);
+        const r = routes[i];
+        const got = await api("/api/routing/test", {
+          method: "POST",
+          body: { indexer: (r.match.indexers || [])[0] || "", kind: (r.match.categories || [])[0] || "audiobook",
+                  protocol: deliveryOf(clients.find((c) => c.id === r.client) || {}) },
+        });
+        const where = got.rule === null ? "No rule matched, so the default" : `Rule ${got.rule + 1} matched`;
+        out.innerHTML = (got.client
+          ? okLine(`${where}: <b>${esc(got.client_label || got.client)}</b> · category <code>${esc(got.args.category || "the client’s own")}</code> · folder <code>${esc(got.args.save_path || "the client’s own")}</code>`)
+          : badLine(got.reason)) + (got.problems || []).map((p) => badLine(p)).join("");
+      } catch (err) { out.innerHTML = badLine(err.message); }
+      spinBtn(btn, false);
+    }
+  };
+
+  $("#add-route", root).onclick = () => {
+    if (!clients.length) { toast("Add a download client first.", { kind: "err" }); return; }
+    routes.push({ match: { indexers: [], categories: ["audiobook"] }, client: clients[0].id, label: "", save_path: "" });
+    drawRoutes(); sync();
+  };
+
+  const adoptClients = (list) => {
+    clients = (list || []).map((x) => ({ id: x.id, type: x.type, url: x.url || "", username: x.username || "",
+      password: x.password || "", api_key: x.api_key || "", category: x.category || "", save_path: x.save_path || "" }));
+  };
+  async function loadRouting() {
+    try {
+      const [c, cov] = await Promise.all([api("/api/download-clients"), api("/api/routing/coverage")]);
+      adoptClients(c.clients);
+      defaultClient = c.default_client || "";
+      defaults = { torrent: "", usenet: "", ...(c.defaults || {}) };
+      advertised = cov.indexers || [];
+      routes = (cov.rules || []).map((r) => ({ match: { indexers: r.match.indexers || [], categories: r.match.categories || [] },
+        client: r.client, label: r.label || "", save_path: r.save_path || "" }));
+      const uncovered = cov.uncovered || [];
+      coverageBox.innerHTML = [
+        !routes.length ? "" : uncovered.length ? `No rule names <b>${uncovered.map(esc).join(", ")}</b>, so those go to the default client.` : "Every indexer you have is named in a rule.",
+        (cov.unknown_clients || []).length ? `<span class="bad-text">${cov.unknown_clients.map(esc).join("; ")}</span>` : "",
+      ].filter(Boolean).join("<br>");
+    } catch (err) {
+      coverageBox.innerHTML = `<span class="bad-text">${esc(err.message)}</span>`;
+    }
+    drawClients(); drawRoutes();
+    // What was just read from the server is the saved state, not a change.
+    const before = { ...collect() };
+    sync();
+    if (saved) {
+      const now = collect();
+      for (const k of Object.keys(now)) if (JSON.stringify(now[k]) !== JSON.stringify(before[k]) || !(k in saved)) saved[k] = now[k];
+    }
+    dirty();
+  }
+  loadRouting();
+
   $$("[data-choice]", root).forEach((seg) => {
     choose(seg.dataset.choice, form[seg.dataset.choice].value);
     seg.onclick = (e) => { const b = e.target.closest("[data-v]"); if (b) choose(seg.dataset.choice, b.dataset.v); };
   });
+
+  // Audible storefronts: an ordered list, because availability is per item and the order is the
+  // search order. Up/down move a row, Test asks that storefront about one known book.
+  const CODES = ["us", "uk", "ca", "au", "in", "de", "fr", "it", "es", "jp"];
+  const NAMES = { us: "United States", uk: "United Kingdom", ca: "Canada", au: "Australia",
+    in: "India", de: "Germany", fr: "France", it: "Italy", es: "Spain", jp: "Japan" };
+  const regionBox = $("#audnex-regions", root);
+  const loadRegions = () => (String(form.audnex_regions.value || "uk").split(",").map((r) => r.trim()).filter(Boolean));
+  const storeRegions = (list) => { form.audnex_regions.value = list.join(","); dirty(); };
+
+  const drawRegions = () => {
+    const list = loadRegions();
+    regionBox.innerHTML = list.map((code, i) => `
+      <div class="region-row" data-i="${i}" style="display:flex;align-items:center;gap:6px;margin:4px 0">
+        <select class="select" data-region style="max-width:220px" aria-label="Storefront for row ${i + 1}">
+          ${CODES.map((c) => `<option value="${c}" ${c === code ? "selected" : ""}>${esc(NAMES[c])} (${c})</option>`).join("")}
+        </select>
+        <button class="btn" type="button" data-act="up" ${i === 0 ? "disabled" : ""} aria-label="Move up">↑</button>
+        <button class="btn" type="button" data-act="down" ${i === list.length - 1 ? "disabled" : ""} aria-label="Move down">↓</button>
+        <button class="btn" type="button" data-act="test">Test</button>
+        <button class="btn" type="button" data-act="del" aria-label="Remove">✕</button>
+        <span class="hint" data-out></span>
+      </div>`).join("");
+  };
+
+  regionBox.onclick = async (e) => {
+    const btn = e.target.closest("[data-act]");
+    if (!btn) return;
+    const row = btn.closest("[data-i]");
+    const i = Number(row.dataset.i);
+    const list = loadRegions();
+    const act = btn.dataset.act;
+    if (act === "del") { list.splice(i, 1); storeRegions(list.length ? list : ["uk"]); drawRegions(); return; }
+    if (act === "up" && i > 0) { [list[i - 1], list[i]] = [list[i], list[i - 1]]; storeRegions(list); drawRegions(); return; }
+    if (act === "down" && i < list.length - 1) { [list[i + 1], list[i]] = [list[i], list[i + 1]]; storeRegions(list); drawRegions(); return; }
+    if (act === "test") {
+      const out = $("[data-out]", row);
+      spinBtn(btn, true);
+      try {
+        const got = await api("/api/settings/test-audnex-region", { method: "POST", body: { region: list[i] } });
+        out.innerHTML = got.ok
+          ? `<div class="rd-result"><span>${got.rating ? `<b>${esc(got.rating)}</b> average` : "no ratings yet"}</span></div>`
+          : `<div class="rd-result bad">${got.reason === "region unavailable"
+              ? "Region unavailable, this book isn&#39;t sold here" : esc(got.reason)}</div>`;
+      } catch (err) {
+        out.innerHTML = `<div class="rd-result bad">${esc(err.message)}</div>`;
+      }
+      spinBtn(btn, false);
+    }
+  };
+
+  regionBox.onchange = (e) => {
+    const sel = e.target.closest("[data-region]");
+    if (!sel) return;
+    const list = loadRegions();
+    const i = Number(sel.closest("[data-i]").dataset.i);
+    if (list.includes(sel.value)) { sel.value = list[i]; return; }  // no duplicates: it is an order
+    list[i] = sel.value;
+    storeRegions(list);
+    drawRegions();
+  };
+
+  $("#add-region", root).onclick = () => {
+    const list = loadRegions();
+    const spare = CODES.find((c) => !list.includes(c));
+    if (!spare) return;
+    storeRegions([...list, spare]);
+    drawRegions();
+  };
+  drawRegions();
   $("#open-import", root).onclick = async () => { await save(true); openImport(form.import_folder.value); };
   $("#whats-new", root).onclick = () => openWhatsNew();
   $("#check-updates", root).onclick = async (e) => {
@@ -2796,15 +3243,10 @@ function Settings(root, page) {
 
   const collect = () => {
     const data = Object.fromEntries(new FormData(form));
-    data.delete_from_rd_after = form.delete_from_rd_after.checked;
-    data.delete_from_ad_after = form.delete_from_ad_after.checked;
-    data.delete_from_tb_after = form.delete_from_tb_after.checked;
-    data.delete_from_pm_after = form.delete_from_pm_after.checked;
-    data.smart_search = form.smart_search.checked;
-    data.auto_search = form.auto_search.checked;
-    data.check_updates = form.check_updates.checked;
-    data.auth_local_bypass = form.auth_local_bypass.checked;
-    data.listener_approval = form.listener_approval.checked;
+    // A form leaves an unticked box out and sends a ticked one as "on", so a switch could be turned on
+    // but never off again. Every switch on the page says true or false instead. Only the ones on the
+    // page: a switch that isn't shown (a client's own, say) keeps what's stored.
+    for (const box of form.querySelectorAll('input[type="checkbox"][name]')) data[box.name] = box.checked;
     data.max_concurrent = Number(data.max_concurrent) || 1;
     data.auto_search_hours = Number(data.auto_search_hours) || 12;
     // A bare address ("abs.example.com") is something to Find, not a setting to save yet.
@@ -2814,15 +3256,15 @@ function Settings(root, page) {
 
   async function save(quiet) {
     state.settings = await api("/api/settings", { method: "PUT", body: collect() });
-    form.rd_api_key.value = state.settings.rd_api_key;
-    form.ad_api_key.value = state.settings.ad_api_key;
-    form.tb_api_key.value = state.settings.tb_api_key;
-    form.pm_api_key.value = state.settings.pm_api_key;
-    form.audiobookshelf_token.value = state.settings.audiobookshelf_token;
-    form.brave_api_key.value = state.settings.brave_api_key;
-    for (const key of ["prowlarr_api_key", "torznab_api_key", "sabnzbd_api_key", "nzbget_password", "qbittorrent_password", "transmission_password", "deluge_password"]) {
-      form[key].value = state.settings[key];
+    state.libRatings = { at: 0, ratings: {} }; // ratings may have been switched on or off
+    for (const key of ["audiobookshelf_token", "brave_api_key", "prowlarr_api_key", "torznab_api_key"]) {
+      if (form[key]) form[key].value = state.settings[key];
     }
+    // The list comes back with its secrets masked, so a typed password doesn't stay in the page.
+    adoptClients(state.settings.clients);
+    defaultClient = state.settings.default_client || "";
+    try { defaults = { torrent: "", usenet: "", ...((await api("/api/download-clients")).defaults || {}) }; } catch { fillDefaults(); }
+    drawClients(); drawRoutes(); sync();
     state.sources = await api("/api/sources"); // the Prowlarr tab appears once it's set up
     updateRdPill();
     if (absConnected() === $("#abs-connected", root).hidden) absShow(); // a pasted API key just connected it
@@ -2853,6 +3295,26 @@ function Settings(root, page) {
     if (btn) btn.hidden = !job.undo;
   }).catch(() => {});
   $("#tidy-open", root).onclick = () => openTidy({ onClose: tidyUndoState });
+  $("#tidy-fill", root).onclick = async (e) => {
+    const btn = e.currentTarget, note = $("#tidy-fill-note", root);
+    spinBtn(btn, true);
+    let checked = 0, filled = 0;
+    try {
+      for (;;) {
+        const r = await api("/api/tidy/fill-details", { method: "POST", body: { batch: 12 } });
+        checked += r.checked; filled += r.filled;
+        note.textContent = r.remaining ? `Asked Audible about ${checked} books, filled in ${filled}. ${r.remaining} to go…` : "";
+        if (!r.remaining || !root.isConnected) break;
+      }
+      note.innerHTML = checked
+        ? `Asked Audible about ${checked} book${checked === 1 ? "" : "s"} and filled in details for ${filled}. Press <b>Preview changes</b> to see the new folder names.`
+        : "Every book already has its series, narrator and year, or Audible has been asked about it before.";
+      await refreshLibrary();
+    } catch (err) {
+      toast(err.message, { kind: "err" });
+    }
+    spinBtn(btn, false);
+  };
   $("#tidy-undo", root).onclick = async (e) => {
     const ok = await modal({ title: "Undo the last tidy?", body: "Every folder it moved goes back where it was. Any covers, descriptions and tags it added stay.", confirm: "Undo" });
     if (!ok) return;
@@ -2926,38 +3388,6 @@ function Settings(root, page) {
     return `Connected to Prowlarr ${esc(r.version)} · <b>${r.indexers}</b> indexer${r.indexers === 1 ? "" : "s"} enabled${ebooks}`;
   });
   tester("torznab", (r) => `Connected to ${esc(r.title)} · book search ${r.book_search ? "<b>available</b>" : "not offered"} · <b>${r.categories}</b> categories`);
-  $$("[data-test-client]", root).forEach((btn) => {
-    btn.onclick = async () => {
-      const name = btn.dataset.testClient;
-      const out = $(`[data-result="${name}"]`, root);
-      spinBtn(btn, true);
-      try {
-        await save(true);
-        const r = await api(`/api/settings/test-client/${name}`, { method: "POST" });
-        out.innerHTML = okLine(`Connected to ${esc(r.label)} ${esc(r.version)}`);
-      } catch (err) {
-        out.innerHTML = `<div class="rd-result bad">${esc(err.message)}</div>`;
-      }
-      spinBtn(btn, false);
-    };
-  });
-
-  $("#test-rd", root).onclick = async (e) => {
-    const btn = e.currentTarget;
-    const out = $("#rd-result", root);
-    spinBtn(btn, true);
-    try {
-      await save(true);
-      const u = await api("/api/settings/test-rd", { method: "POST" });
-      const exp = u.expiration ? new Date(u.expiration).toLocaleDateString(undefined, { dateStyle: "medium" }) : "";
-      out.innerHTML = `<div class="rd-result">${I.check.replace("<svg", '<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"')}
-        <span>Connected as <b>${esc(u.username)}</b> · ${esc(u.type)}${exp ? ` until ${esc(exp)}` : ""}</span></div>`;
-    } catch (err) {
-      out.innerHTML = `<div class="rd-result bad">${esc(err.message)}</div>`;
-    }
-    spinBtn(btn, false);
-  };
-
   // Notifications: each destination saves on its own, like people on the Users page, not with the save bar.
   // The editor's fields have no names, so the Settings form (and its save bar) never sees them.
   const notifyList = $("#notify-list", root);
@@ -3017,7 +3447,7 @@ function Settings(root, page) {
     </div>`;
   const openEditor = (n) => {
     let kind = n?.kind || "ntfy";
-    const events = n?.events || ["wanted", "completed", "failed"];
+    const events = n?.events || ["wanted", "found", "completed", "failed"];
     $("#add-notifier", root).hidden = true;
     editor.hidden = false;
     editor.innerHTML = `
@@ -3051,7 +3481,7 @@ function Settings(root, page) {
       <fieldset class="ne-events">
         <legend>Tell me when</legend>
         ${Object.entries(notifyMeta.events).map(([k, label]) => `<label class="switch"><input type="checkbox" value="${k}" ${events.includes(k) ? "checked" : ""}><i></i>${{
-          wanted: "Someone adds a book to Wanted", grabbed: "A download starts", completed: "A book is in the library", failed: "A download fails",
+          wanted: "Someone adds a book to Wanted", found: "Searching finds a release to approve", grabbed: "A download starts", completed: "A book is in the library", failed: "A download fails",
         }[k] || esc(label)}</label>`).join("")}
       </fieldset>
       <div class="cta-row" style="justify-content:flex-start">
@@ -3156,7 +3586,7 @@ function Settings(root, page) {
   renderNotifiers();
 
   // The event log: what Narratarr announced, and where each event went. Refreshes itself while open.
-  const LOG_EVENTS = [["", "All", ""], ["wanted", "Requests", "accent"], ["grabbed", "Started", "info"], ["completed", "Finished", "ok"], ["failed", "Failed", "bad"]];
+  const LOG_EVENTS = [["", "All", ""], ["wanted", "Requests", "accent"], ["found", "Found", "accent"], ["grabbed", "Started", "info"], ["completed", "Finished", "ok"], ["failed", "Failed", "bad"]];
   const logState = { event: "", q: "", items: [], more: false, open: new Set(), counts: {}, kept: 500 };
   const logList = $("#log-list", root);
   const logStamp = (at) => {
@@ -3266,135 +3696,7 @@ function Settings(root, page) {
     loadLog();
   }, 8000);
 
-  // AllDebrid and TorBox: connect with a short code the user enters on their site, or with a pasted key.
-  const codeConnect = ({ p, name, client, site, start, check, line }) => {
-    const out = () => $(`#${p}-result`, root);
-    const card = () => {
-      const on = Boolean(state.settings[`${p}_configured`]);
-      $(`#${p}-pin-title`, root).textContent = on ? `${name} is connected` : "Connect with a code";
-      $(`#${p}-pin-desc`, root).textContent = on
-        ? "Test checks the account. To use a different one, connect again."
-        : `Narratarr shows a short code, you enter it on ${site}, and you’re connected. There’s no key to copy, and your password never comes here.`;
-      $(`#${p}-pin`, root).textContent = on ? "Connect again" : `Connect ${name}`;
-      $(`#${p}-pin`, root).classList.toggle("primary", !on);
-      $(`#${p}-pin-start [data-${p}-test]`, root).hidden = !on;
-      if (on) $(`[data-v="${client}"] small`, root).innerHTML = `<i class="dot ok"></i>Ready`;
-    };
-    card();
-    $$(`[data-${p}-test]`, root).forEach((btn) => {
-      btn.onclick = async () => {
-        spinBtn(btn, true);
-        try {
-          await save(true);
-          card();
-          out().innerHTML = line(await api(`/api/settings/test-${p}`, { method: "POST" }));
-        } catch (err) {
-          out().innerHTML = badLine(err.message);
-        }
-        spinBtn(btn, false);
-      };
-    });
-    let timer = 0;
-    const stop = () => {
-      clearTimeout(timer);
-      $(`#${p}-pin-wait`, root).hidden = true;
-      $(`#${p}-pin-start`, root).hidden = false;
-    };
-    $(`#${p}-pin-cancel`, root).onclick = stop;
-    $(`#${p}-pin`, root).onclick = async (e) => {
-      const btn = e.currentTarget;
-      const wait = $(`#${p}-pin-wait`, root);
-      out().innerHTML = "";
-      spinBtn(btn, true);
-      let got;
-      try {
-        got = await api(start, { method: "POST" });
-      } catch (err) {
-        out().innerHTML = badLine(err.message);
-        spinBtn(btn, false);
-        return;
-      }
-      spinBtn(btn, false);
-      const code = got.pin || got.code;
-      $(`#${p}-pin-code`, root).textContent = code;
-      $(`#${p}-pin-link`, root).href = got.user_url;
-      $(`#${p}-pin-start`, root).hidden = true;
-      wait.hidden = false;
-      const ends = Date.now() + got.expires_in * 1000;
-      const every = Math.max(3, got.interval || 3) * 1000;
-      const tick = async () => {
-        if (!wait.isConnected || wait.hidden) return; // cancelled, or left Settings
-        const left = Math.ceil((ends - Date.now()) / 60000);
-        if (left <= 0) {
-          stop();
-          out().innerHTML = badLine(`That code has expired. Choose Connect ${name} to get a new one.`);
-          return;
-        }
-        $(`#${p}-pin-left`, root).textContent = `Waiting for the code · expires in ${left} min`;
-        try {
-          const r = await api(check, { method: "POST", body: got.pin ? { pin: code } : { code } });
-          if (!wait.isConnected || wait.hidden) return;
-          if (r.connected) {
-            // The server saved the key and chose this service; keep anything else typed here as it was.
-            const key = `${p}_api_key`;
-            const { torrent_client, torrent_configured } = r.settings;
-            Object.assign(state.settings, { [key]: r.settings[key], [`${p}_configured`]: true, torrent_client, torrent_configured });
-            form[key].value = r.settings[key];
-            if (saved) Object.assign(saved, { [key]: r.settings[key], torrent_client });
-            choose("torrent_client", torrent_client);
-            stop();
-            card();
-            updateRdPill();
-            statuses();
-            out().innerHTML = line(r);
-            return;
-          }
-        } catch (err) {
-          stop();
-          out().innerHTML = badLine(err.message);
-          return;
-        }
-        timer = setTimeout(tick, every);
-      };
-      timer = setTimeout(tick, every);
-    };
-  };
   const badLine = (text) => `<div class="rd-result bad">${esc(text)}</div>`;
-  codeConnect({
-    p: "ad", name: "AllDebrid", client: "alldebrid", site: "alldebrid.com",
-    start: "/api/settings/alldebrid/pin", check: "/api/settings/alldebrid/pin/check",
-    line: (u) => {
-      if (u.warning) return badLine(u.warning);
-      if (!u.premium && !u.trial) return badLine(`Connected as ${u.username}, but the account isn’t premium. AllDebrid needs premium for torrents.`);
-      const until = u.premium_until ? new Date(u.premium_until * 1000).toLocaleDateString(undefined, { dateStyle: "medium" }) : "";
-      return okLine(`Connected as <b>${esc(u.username)}</b> · ${u.trial ? "free trial" : "premium"}${until ? ` until ${esc(until)}` : ""}`);
-    },
-  });
-  codeConnect({
-    p: "tb", name: "TorBox", client: "torbox", site: "TorBox",
-    start: "/api/settings/torbox/code", check: "/api/settings/torbox/code/check",
-    line: (u) => {
-      if (u.warning) return badLine(u.warning);
-      const until = u.premium_until ? new Date(u.premium_until).toLocaleDateString(undefined, { dateStyle: "medium" }) : "";
-      return okLine(`Connected${u.email ? ` as <b>${esc(u.email)}</b>` : ""}${u.plan ? ` · ${esc(u.plan)} plan` : ""}${until ? ` until ${esc(until)}` : ""}`);
-    },
-  });
-  $("#test-pm", root).onclick = async (e) => {
-    const btn = e.currentTarget;
-    const out = $("#pm-result", root);
-    spinBtn(btn, true);
-    try {
-      await save(true);
-      const u = await api("/api/settings/test-pm", { method: "POST" });
-      const until = u.premium_until ? new Date(u.premium_until * 1000).toLocaleDateString(undefined, { dateStyle: "medium" }) : "";
-      out.innerHTML = u.premium ? okLine(`Connected · premium${until ? ` until ${esc(until)}` : ""}`)
-        : badLine("Connected, but the account isn’t premium. Premiumize needs premium for torrents.");
-      if (u.premium) $('[data-v="premiumize"] small', root).innerHTML = `<i class="dot ok"></i>Ready`;
-    } catch (err) {
-      out.innerHTML = badLine(err.message);
-    }
-    spinBtn(btn, false);
-  };
 
   // Audiobookshelf: find the server, sign in once (which creates an API key), pick a library.
   let absServer = null; // what Find last found: {url, version, ready, password_login, insecure}
@@ -3425,6 +3727,7 @@ function Settings(root, page) {
     absServer = server;
     form.audiobookshelf_url.value = server.url;
     $("#abs-found", root).innerHTML = okLine(`Found Audiobookshelf <b>${esc(server.version)}</b> at <code>${esc(server.url)}</code>`)
+      + (server.note ? `<span class="hint">${esc(server.note)}</span>` : "")
       + (server.ready ? "" : badLine("Finish setting up Audiobookshelf first: it doesn’t have an admin account yet."))
       + (server.password_login ? "" : badLine("This server only allows single sign-on, so paste an API key below instead."));
     $("#abs-insecure", root).hidden = !server.insecure;
@@ -3443,7 +3746,7 @@ function Settings(root, page) {
     spinBtn(btn, true);
     out.innerHTML = `<span class="hint">${address ? `Looking for Audiobookshelf at ${esc(address)}…` : "Looking on this computer, in Docker, then across your home network…"}</span>`;
     try {
-      const { servers } = await api("/api/audiobookshelf/find", { method: "POST", body: { address } });
+      const { servers, reason } = await api("/api/audiobookshelf/find", { method: "POST", body: { address } });
       if (servers.length === 1) {
         absFound(servers[0]);
       } else if (servers.length) {
@@ -3451,9 +3754,9 @@ function Settings(root, page) {
           <div class="abs-pick">${servers.map((sv, i) => `<button class="btn" type="button" data-i="${i}"><span class="mono">${esc(sv.url)}</span><small>${esc(sv.version)}</small></button>`).join("")}</div>`;
         $$(".abs-pick [data-i]", out).forEach((b) => { b.onclick = () => absFound(servers[b.dataset.i]); });
       } else {
-        out.innerHTML = badLine(address
+        out.innerHTML = badLine(reason || (address
           ? `Audiobookshelf didn’t answer at ${address}. Check the address, and that this machine can reach it.`
-          : "No Audiobookshelf found nearby. Type its address and press Find.");
+          : "No Audiobookshelf found nearby. Type its address and press Find."));
       }
     } catch (err) {
       out.innerHTML = badLine(err.message);
@@ -3716,6 +4019,26 @@ function libraryLiveHTML(lib) {
       <button class="btn" data-act="want">${I.bookmark} Add to Wanted</button>
     </div>`;
   }
+  if (lib.status === "requested" && lib.found_by_search) {
+    const found = esc(lib.release || lib.title);
+    if (isAdmin()) {
+      return `<div class="state requested">
+          <div class="top"><span>${I.bell} Found by automatic search</span><span>${esc(ago(lib.updated_at || lib.added_at))}</span></div>
+          <p>Narratarr found <b>${found}</b>${lib.size ? ` (${esc(lib.size)})` : ""}${lib.requested_by_name ? ` for ${esc(lib.requested_by_name)}` : ""}. Check its language and format, then approve it to download. Keep looking turns this release down, and Narratarr won’t pick it again.</p>
+        </div>
+        <div class="cta">
+          <button class="btn primary" data-act="approve">${I.check} Approve</button>
+          <button class="btn" data-act="releases">${I.list} Pick another</button>
+          <button class="btn" data-act="keep-looking">${I.search} Keep looking</button>
+          <button class="btn ghost danger" data-act="remove">${I.trash} Decline</button>
+        </div>`;
+    }
+    return `<div class="state requested">
+        <div class="top"><span>${I.bell} Awaiting approval</span><span>${esc(ago(lib.updated_at || lib.added_at))}</span></div>
+        <p>Narratarr found <b>${found}</b>. It’ll download once an admin approves it.</p>
+      </div>
+      ${mine(lib) ? `<div class="cta"><button class="btn ghost danger" data-act="remove" data-mine>${I.trash} Take back request</button></div>` : ""}`;
+  }
   if (lib.status === "requested") {
     const who = lib.requested_by_name ? esc(lib.requested_by_name) : "A listener";
     const picked = !isCatalog(lib.source) && (lib.release || lib.title);
@@ -3840,9 +4163,14 @@ function releasesHTML(res) {
       const quality = r.match >= res.auto_match ? "good" : r.match >= 75 ? "ok" : "weak";
       const facts = [label(r), r.protocol === "usenet" ? "Usenet" : r.protocol === "torrent" ? "Torrent" : "Direct",
         r.format, r.size, r.language, r.seeders != null ? `${r.seeders} seeder${r.seeders === 1 ? "" : "s"}` : "", r.posted].filter(Boolean);
-      return `<div class="rel ${r.language_ok === false ? "other-lang" : ""}" ${r.language_ok === false ? 'title="Not in your languages: automatic search skips it, but you can still grab it"' : ""}>
+      // A release that failed for this book, or that an admin turned down: still there to grab on
+      // purpose, but marked, so nobody picks it again by accident. Automatic picking skips both.
+      const flag = r.failed ? `<span class="rel-flag bad" title="${esc(r.failed)}">${I.alert}Failed before</span>`
+        : r.turned_down ? `<span class="rel-flag" title="Turned down for this book. Automatic search won’t pick it again.">Turned down</span>` : "";
+      const dim = r.failed || r.turned_down ? "spent" : r.language_ok === false ? "other-lang" : "";
+      return `<div class="rel ${dim}" ${r.language_ok === false && !dim.includes("spent") ? 'title="Not in your languages: automatic search skips it, but you can still grab it"' : ""}>
         <div class="rel-main"><b title="${esc(r.release || r.title)}">${esc(r.release || r.title)}</b>
-          <small>${facts.map(esc).join(" · ")}</small></div>
+          <small>${flag}${facts.map(esc).join(" · ")}</small></div>
         <span class="match ${quality}" title="How closely it matches the title and author">${r.match}%</span>
         <button class="btn sm" data-grab="${i}" ${r.usable ? "" : `disabled title="Set up a download client for ${r.protocol === "usenet" ? "Usenet" : "torrents"} first"`}>Grab</button>
       </div>`;
@@ -3871,19 +4199,45 @@ function editDetails(lib) {
   const head = $("#meta-head", drawer);
   if (!lib || !head || $("#meta-edit", head)) return;
   const shown = head.innerHTML;
+  const ser = (lib.series || [])[0] || {};
   head.innerHTML = `<form class="meta-edit" id="meta-edit" autocomplete="off">
       <h4>Edit details</h4>
       <div class="field"><label for="me-title">Title</label><input class="input" id="me-title" name="title" value="${esc(lib.title)}" required /></div>
       <div class="field"><label for="me-author">Author</label><input class="input" id="me-author" name="author" value="${esc(lib.author || "")}" /></div>
       <div class="field"><label for="me-narrators">Narrated by</label><input class="input" id="me-narrators" name="narrators" value="${esc((lib.narrators || []).join(", "))}" />
         <span class="hint">Separate several names with commas.</span></div>
-      <p class="hint">This changes what Narratarr shows, and how it matches authors you follow. Your files and folders stay as they are.</p>
-      <div class="cta"><button class="btn primary" type="submit">Save</button><button class="btn ghost" type="button" data-cancel>Cancel</button></div>
+      <div class="me-row">
+        <div class="field"><label for="me-series">Series</label><input class="input" id="me-series" name="series" value="${esc(ser.title || "")}" placeholder="Not in a series" /></div>
+        <div class="field me-num"><label for="me-number">Book</label><input class="input" id="me-number" name="series_number" inputmode="decimal" value="${esc(ser.sequence || "")}" placeholder="1" /></div>
+        <div class="field me-num"><label for="me-year">Year</label><input class="input" id="me-year" name="year" inputmode="numeric" maxlength="4" value="${esc((lib.released || "").slice(0, 4))}" placeholder="1965" /></div>
+      </div>
+      <p class="hint">This changes what Narratarr shows, how it matches authors you follow, and the folder name Tidy library gives the book. Your files and folders stay as they are until you tidy.</p>
+      <div class="cta"><button class="btn primary" type="submit">Save</button><button class="btn" type="button" data-audible>${I.search} Fill in from Audible</button><button class="btn ghost" type="button" data-cancel>Cancel</button></div>
     </form>`;
   const form = $("#meta-edit", head);
   const f = form.elements;
   f.title.focus();
   $("[data-cancel]", form).onclick = () => { head.innerHTML = shown; };
+  // Audible's record of the book fills the empty fields, for you to check before saving.
+  $("[data-audible]", form).onclick = async (e) => {
+    const btn = e.currentTarget;
+    spinBtn(btn, true);
+    try {
+      const a = await api(`/api/library/${lib.id}/audible-match`);
+      const filled = [];
+      const put = (name, value) => { if (value && !f[name].value.trim()) { f[name].value = value; filled.push(name); } };
+      put("narrators", (a.narrators || []).join(", "));
+      put("series", a.series);
+      put("series_number", a.series_number);
+      put("year", a.year);
+      // A name that led with its series ("Playing for Keeps #1 - Consider Me"): the series fields hold that now.
+      if (a.series_first && f.title && f.series.value.trim()) { f.title.value = a.series_first; filled.push("title"); }
+      toast(filled.length ? "Filled in from Audible. Check them, then save." : "Audible has nothing these fields are missing.", { kind: "ok" });
+    } catch (err) {
+      toast(err.message, { kind: "err" });
+    }
+    spinBtn(btn, false);
+  };
   form.onsubmit = async (e) => {
     e.preventDefault();
     const btn = $('[type="submit"]', form);
@@ -3893,6 +4247,9 @@ function editDetails(lib) {
         title: f.title.value,
         author: f.author.value,
         narrators: f.narrators.value.split(/[,;]/).map((n) => n.trim()).filter(Boolean),
+        series: f.series.value,
+        series_number: f.series_number.value,
+        year: f.year.value,
       };
       const saved = await api(`/api/library/${lib.id}`, { method: "PATCH", body });
       await refreshLibrary();
