@@ -16,6 +16,7 @@ Every 6 hours the fork checks for a new official Narratarr release, merges it, a
 `ghcr.io/reignbeaux7/narratarr:latest`. Each merge is listed here.
 
 <!-- sync-upstream adds a line below for every release it merges -->
+- 2026-11-12: merged Narratarr **v0.9.4** (also brings in 0.9.0–0.9.3; merged by hand, since 0.9.0 added a GitHub workflow the automatic sync isn't allowed to push)
 - 2026-11-02: merged Narratarr **v0.8.8** (tidy library)
 
 ## Fork changes
