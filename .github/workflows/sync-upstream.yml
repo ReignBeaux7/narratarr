@@ -5,6 +5,12 @@
 # release on this fork with Narratarr's notes plus what the fork adds.
 # The fix lives in its own files, so releases merge in cleanly. If one ever can't merge,
 # this run fails, GitHub emails you, and main is left exactly as it was.
+#
+# GitHub doesn't let this workflow's own token push a release that changes Narratarr's
+# workflow files (.github/workflows). With a SYNC_TOKEN secret (a fine-grained token with
+# Contents + Workflows write on this repo) those releases go through too. Without one,
+# such a release fails the run once (one email, saying what to do) and then waits
+# quietly, instead of failing every 6 hours.
 # Run it by hand any time: Actions tab -> "Sync with upstream releases" -> Run workflow.
 
 name: Sync with upstream releases
@@ -24,10 +30,13 @@ jobs:
   sync:
     if: github.repository != 'narratarr/narratarr'
     runs-on: ubuntu-latest
+    env:
+      HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: Merge the newest upstream release
         id: merge
@@ -62,12 +71,22 @@ jobs:
             git add FORK-CHANGELOG.md
             git diff --cached --quiet || git commit -m "Fork changelog: merged Narratarr ${latest#upstream/}"
           fi
-          git push origin HEAD:main
+          if ! git push origin HEAD:main 2> push.log; then
+            cat push.log
+            if grep -q "workflows. permission" push.log; then
+              echo "needs_token=${latest#upstream/}" >> "$GITHUB_OUTPUT"
+              echo "::warning::Narratarr ${latest#upstream/} changes GitHub workflow files, which this token can't push. Opening an issue with what to do."
+              exit 0
+            fi
+            exit 1
+          fi
+          cat push.log
           echo "updated=${latest#upstream/}" >> "$GITHUB_OUTPUT"
 
-      # A push made by this workflow doesn't start other workflows on its own, so ask for the image.
+      # A push made with this workflow's own token doesn't start other workflows, so ask for the image.
+      # (A push made with SYNC_TOKEN starts the build by itself.)
       - name: Build the new image
-        if: steps.merge.outputs.updated != ''
+        if: steps.merge.outputs.updated != '' && env.HAS_SYNC_TOKEN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run docker.yml --ref main --repo "${{ github.repository }}"
@@ -85,3 +104,19 @@ jobs:
           python3 .github/fork-release-notes.py "$VERSION" > release-notes.md
           gh release create "fork-$VERSION" --repo "${{ github.repository }}" --target "$(git rev-parse HEAD)" \
             --title "Narratarr ${VERSION#v} + phone fix" --notes-file release-notes.md --latest
+
+      - name: Say once that this release needs a hand
+        if: steps.merge.outputs.needs_token != ''
+        env:
+          VERSION: ${{ steps.merge.outputs.needs_token }}
+        run: |
+          # A tag marks that this release was already reported, so the next runs stay quiet.
+          tag="needs-manual-sync-$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Already reported Narratarr $VERSION. Waiting for a manual sync; nothing changed."
+            exit 0
+          fi
+          git tag "$tag" "$(git rev-parse origin/main)"
+          git push origin "refs/tags/$tag"
+          echo "::error::Narratarr $VERSION changes GitHub workflow files, so it can't be synced automatically. Nothing changed: the fork and your server stay on the previous version. Fix: on the fork's main page click Sync fork → Update branch (never Discard commits), or ask Claude. To make these automatic, add a SYNC_TOKEN secret (fine-grained token, this repo only, Contents + Workflows read/write)."
+          exit 1

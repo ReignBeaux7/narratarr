@@ -21,6 +21,11 @@ Every 6 hours the fork checks for a new official Narratarr release, merges it, a
 
 ## Fork changes
 
+### 2026-11-12
+- The sync no longer fails every 6 hours when a Narratarr release changes its own GitHub
+  workflow files (which the sync isn't allowed to push). It reports it once, then waits.
+  An optional `SYNC_TOKEN` secret lets those releases through automatically.
+
 ### 2026-11-03
 - **Release picking** (Settings → Search & sources → Release picking):
   - **Most seeders wins:** among releases that clearly match a Wanted book, the one with the most
