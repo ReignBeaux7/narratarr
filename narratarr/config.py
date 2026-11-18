@@ -41,6 +41,17 @@ class Settings:
     audiobookshelf_url: str = ""
     audiobookshelf_token: str = ""
     audiobookshelf_library_id: str = ""
+    # A second library to rescan after an ebook download, for a layout that files ebooks apart with
+    # {kind}. Empty: ebooks go to the library above, like everything else.
+    audiobookshelf_ebook_library_id: str = ""
+    # Hardcover (hardcover.app): books on your Want to Read shelf come to Wanted. Connected with Hardcover's
+    # device sign-in, so no token is ever pasted in. The tokens never leave the server (see SERVER_ONLY).
+    hardcover_access_token: str = ""
+    hardcover_refresh_token: str = ""
+    hardcover_token_expires: float = 0.0
+    hardcover_user: str = ""  # the username it's connected as, to show in Settings
+    hardcover_sync: bool = True  # look at the shelf now and then while connected
+    hardcover_format: str = "audiobook"  # what a book from the shelf is wanted as: audiobook, ebook or both
     prowlarr_url: str = ""
     prowlarr_api_key: str = ""
     prowlarr_categories: str = "3030"  # Newznab/Torznab "Audio/Audiobook"
@@ -81,6 +92,9 @@ class Settings:
     auto_search_hours: int = 12
     # A release that searching finds on its own waits under Awaiting approval instead of downloading.
     found_needs_approval: bool = False
+    # Look up a finished download's missing series, narrators and year on Audible before its folder is
+    # named, so a layout that uses them gets them. Off by default: it's a request to Audible per book.
+    fill_details_before_filing: bool = False
     # When a download fails because of the release itself (a dead torrent, a failed repair, no audio in
     # it), look for another release of the book and take that instead, like Sonarr and Radarr do.
     retry_failed_downloads: bool = True
@@ -101,14 +115,22 @@ class Settings:
     # settings above the first time, so an existing install keeps working untouched.
     clients: list = field(default_factory=list)
     default_client: str = ""  # the client a grab falls through to when no route matches
+    # An optional local torrent client (a client entry id) to use when the selected
+    # debrid service says it does not have a release cached. Empty means off, which is
+    # the default: sending a grab somewhere the user did not choose is not something to
+    # do uninvited.
+    debrid_fallback_client: str = ""
     # Ordered routing rules, versioned so a future format change is a migration and not a repair.
     client_routes: dict = field(default_factory=lambda: {"version": 1, "rules": []})
 
     def public(self) -> dict:
-        """Settings safe to send to the browser (secrets masked)."""
+        """Settings safe to send to the browser (secrets masked, account tokens left out)."""
         d = asdict(self)
         for key in SECRETS:
             d[key] = _mask(d[key], key)
+        for key in SERVER_ONLY:
+            d.pop(key, None)
+        d["hardcover_connected"] = bool(self.hardcover_refresh_token or self.hardcover_access_token)
         from .downloaders import entry_from_dict
 
         d["clients"] = []
@@ -150,11 +172,15 @@ class Settings:
         return d
 
 
+# Never sent to the browser, even masked, and never changed through the settings form: they act as the
+# user's own account elsewhere. Only the code that connects and disconnects that account writes them.
+SERVER_ONLY = ("hardcover_access_token", "hardcover_refresh_token", "hardcover_token_expires")
 SECRETS = (
     "rd_api_key", "ad_api_key", "tb_api_key", "pm_api_key", "audiobookshelf_token", "brave_api_key", "prowlarr_api_key", "sabnzbd_api_key",
     "nzbget_password", "qbittorrent_password", "transmission_password", "deluge_password", "torznab_api_key",
 )
 CHOICES = {
+    "hardcover_format": ("audiobook", "ebook", "both"),
     "search_provider": ("audiobookbay", "brave"),
     "usenet_client": ("sabnzbd", "nzbget"),
     "torrent_client": ("realdebrid", "alldebrid", "torbox", "premiumize", "qbittorrent", "transmission", "deluge"),
@@ -247,8 +273,13 @@ def update(changes: dict) -> Settings:
                 from . import routing
 
                 v = routing.validate(v, s)
-            elif k == "default_client":
+            elif k in ("default_client", "debrid_fallback_client"):
                 v = str(v or "").strip().lower()
+            elif k in ("audiobookshelf_library_id", "audiobookshelf_ebook_library_id"):
+                # Sent to Audiobookshelf as part of a URL path, so only an id's own characters.
+                v = str(v or "").strip()
+                if v and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", v):
+                    raise ValueError("That isn't an Audiobookshelf library id.")
             if k == "max_concurrent":
                 v = max(1, min(int(v), 8))
             elif k == "auto_search_hours":
@@ -275,7 +306,14 @@ def update(changes: dict) -> Settings:
         ids = [c["id"] for c in s.clients]
         if s.default_client not in ids:
             s.default_client = ids[0] if ids else ""
-        from .downloaders import DELIVERY
+        from .downloaders import DEBRID as DEBRID_TYPES, DELIVERY
+
+        # The uncached fallback may only name a local torrent client that exists. Anything else
+        # (a removed client, a cloud service, a Usenet client) turns it off rather than misroutes.
+        local_torrent = {c["id"] for c in s.clients
+                         if DELIVERY.get(c["type"]) == "torrent" and c["type"] not in DEBRID_TYPES}
+        if s.debrid_fallback_client not in local_torrent:
+            s.debrid_fallback_client = ""
 
         flat_for = {"usenet": "usenet_client", "torrent": "torrent_client"}
         if s.default_client != prev_default and "default_client" in changes:

@@ -2102,6 +2102,7 @@ function Activity(root) {
 const LAYOUT_VARS = [
   ["author", "The author"], ["title", "The book's title"], ["narrator", "The narrator (up to two)"],
   ["series", "The series name"], ["series_number", "The book's number in its series, like 1 or 2.5"], ["year", "The year it came out"],
+  ["kind", "Audiobooks or Ebooks, to keep the two in separate folders (say, for separate Audiobookshelf libraries)"],
 ];
 // The languages offered under Settings → Search & sources (as narratarr/languages.py COMMON).
 const AUDIBLE_STORES = [["us", "United States"], ["uk", "United Kingdom"], ["ca", "Canada"], ["au", "Australia"], ["in", "India"],
@@ -2121,9 +2122,10 @@ const LAYOUT_PRESETS = [
   ["Author / Title", "{author}/{title}"],
   ["Author / Series / Title", "{author}/{series}/{series_number} - {title}"],
   ["Audiobookshelf style", "{author}/{series}/Vol {series_number} - {year} - {title} {{narrator}}"],
+  ["Audiobooks and ebooks apart", "{kind}/{author}/{title}"],
 ];
-const LAYOUT_SAMPLE = { author: "Frank Herbert", title: "Dune", narrator: "Scott Brick", series: "Dune Chronicles", series_number: "1", year: "1965" };
-const LAYOUT_SAMPLE_SOLO = { author: "Andy Weir", title: "Project Hail Mary", narrator: "Ray Porter", series: "", series_number: "", year: "2021" };
+const LAYOUT_SAMPLE = { author: "Frank Herbert", title: "Dune", narrator: "Scott Brick", series: "Dune Chronicles", series_number: "1", year: "1965", kind: "Audiobooks" };
+const LAYOUT_SAMPLE_SOLO = { author: "Andy Weir", title: "Project Hail Mary", narrator: "Ray Porter", series: "", series_number: "", year: "2021", kind: "Audiobooks" };
 const LAYOUT_EDGES = /^[\s\-–—_.,;:#~]+|[\s\-–—_.,;:#~]+$/g;
 
 function layoutClean(part) {
@@ -2245,7 +2247,10 @@ function Settings(root, page) {
             <div class="layout-vars" role="group" aria-label="Add a variable">
               ${LAYOUT_VARS.map(([v, tip]) => `<button type="button" class="fill-in" data-var="${v}" title="${esc(tip)}">{${v}}</button>`).join("")}
             </div>
-            <span class="hint">Put <code>/</code> between folders. If a book has no series or year, that part is left out, along with the words around it. Double braces keep braces in the name: <code>{{narrator}}</code> becomes <code>{Ray Porter}</code>, which Audiobookshelf reads as the narrator. Ebooks go into the same folder as their audiobook.</span>
+            <span class="hint">Put <code>/</code> between folders. If a book has no series or year, that part is left out, along with the words around it. Double braces keep braces in the name: <code>{{narrator}}</code> becomes <code>{Ray Porter}</code>, which Audiobookshelf reads as the narrator. Ebooks go into the same folder as their audiobook, unless the layout has <code>{kind}</code>: then audiobooks go under <code>Audiobooks</code> and ebooks under <code>Ebooks</code>, so each can be its own Audiobookshelf library.</span>
+          </div>
+          <div class="set-row">
+            <label class="switch"><input type="checkbox" name="fill_details_before_filing" ${s.fill_details_before_filing ? "checked" : ""}><i></i><span><b>Fill in missing details before filing a download</b><small>When a download finishes without a series, narrator or year, Narratarr looks it up on Audible before naming its folder, so the layout above can use them. Only empty details are filled, and only from a book whose title and author match.</small></span></label>
           </div>
           <div class="set-row">
             <label for="max_concurrent"><b>Downloads at once</b><small>More finish sooner, but share your bandwidth.</small></label>
@@ -2267,7 +2272,7 @@ function Settings(root, page) {
             <button class="btn primary" type="button" id="tidy-open">Preview changes</button>
           </div>
         </div>
-        <div class="body"><span class="hint" id="tidy-fill-note">Books whose tags don’t say their series, narrator or year come out as singles. <b>Fill in missing details</b> asks Audible for them, book by book, and only takes a book whose title and author match exactly. Nothing is moved or overwritten. Fix any single book with Edit details.</span></div>
+        <div class="body"><span class="hint" id="tidy-fill-note">Books whose tags don’t say their series, narrator or year come out as singles. <b>Fill in missing details</b> takes them from your Audiobookshelf library when it's connected and has the book, then asks Audible for the rest, book by book, only taking a book whose title and author match exactly. Nothing is moved or overwritten. Fix any single book with Edit details.</span></div>
         <div class="body" id="tidy-gate" hidden><span class="hint">${I.alert} Save your library folder and layout first, so the preview uses them.</span></div>
       </section>
 
@@ -2506,6 +2511,40 @@ function Settings(root, page) {
         </div>
       </section>
 
+      <section class="panel" data-page="search" id="hc-panel" hidden>
+        <div class="ph abs-connected-head" id="hc-head" hidden>
+          <span class="abs-badge" aria-hidden="true">${I.books}</span>
+          <div class="abs-who"><h3>Hardcover</h3><p class="desc">Connected as <b id="hc-user"></b>. Books you mark <b>Want to Read</b> come to Wanted by themselves.</p></div>
+          <button class="btn" type="button" id="hc-disconnect">Disconnect</button>
+        </div>
+        <div class="ph" id="hc-intro"><h3>Hardcover</h3><p class="desc">Mark a book <b>Want to Read</b> on Hardcover and it comes to Wanted here, matched on Audible, then Narratarr looks for it like any other.</p></div>
+        <div class="body">
+          <div class="field" id="hc-connect">
+            <div><button class="btn primary" type="button" id="hc-start">${I.books} Connect Hardcover</button></div>
+            <div id="hc-code"></div>
+            <span class="hint">You approve it on hardcover.app with a short code, so you never paste a password or key in here. Narratarr can only read your profile and your shelves, never change anything on Hardcover, and Disconnect signs it out there too.</span>
+          </div>
+          <div id="hc-on" hidden>
+            <div class="set-row">
+              <label class="switch"><input type="checkbox" name="hardcover_sync" ${s.hardcover_sync ? "checked" : ""}><i></i><span><b>Check the shelf every six hours</b><small>Up to 25 new books each time. Each book is added once, so a book you take off Wanted stays off.</small></span></label>
+            </div>
+            <div class="set-row">
+              <label for="hardcover_format"><b>Add books as</b><small>What a book from your shelf is wanted as.</small></label>
+              <select class="select" id="hardcover_format" name="hardcover_format">
+                ${[["audiobook", "Audiobook"], ["ebook", "Ebook"], ["both", "Audiobook and ebook"]]
+                  .map(([v, l]) => `<option value="${v}" ${s.hardcover_format === v ? "selected" : ""}>${l}</option>`).join("")}
+              </select>
+            </div>
+            <div class="set-row">
+              <label><b>From your shelf</b><small id="hc-last"></small></label>
+              <button class="btn" type="button" id="hc-sync">${I.retry} Check now</button>
+            </div>
+            <ul class="hc-recent" id="hc-recent"></ul>
+            <div><button class="btn ghost sm" type="button" id="hc-retry" hidden>${I.search} Look again for the ones not found</button></div>
+          </div>
+        </div>
+      </section>
+
       <section class="panel" data-page="search">
         <div class="ph"><h3>Rating metadata</h3><p class="desc">The star pill on every Discover card. Ratings are read from a local cache, never fetched while a page loads: a book with no rating yet is filled in the background and appears on your next search.</p></div>
         <div class="body">
@@ -2576,6 +2615,14 @@ function Settings(root, page) {
                   <option value="${esc(s.audiobookshelf_library_id)}">${s.audiobookshelf_library_id ? "Loading…" : "Choose a library"}</option>
                 </select>
                 <button class="btn" type="button" id="test-audiobookshelf">Test</button>
+              </div>
+            </div>
+            <div class="set-row">
+              <label for="audiobookshelf_ebook_library_id"><b>Library for ebooks</b><small>For a folder layout with {kind}. It should watch the Ebooks folder.</small></label>
+              <div class="input-row">
+                <select class="select abs-select" id="audiobookshelf_ebook_library_id" name="audiobookshelf_ebook_library_id">
+                  <option value="${esc(s.audiobookshelf_ebook_library_id || "")}">${s.audiobookshelf_ebook_library_id ? "Loading…" : "The same library"}</option>
+                </select>
               </div>
             </div>
             <div id="audiobookshelf-result"></div>
@@ -2672,7 +2719,9 @@ function Settings(root, page) {
     const template = form.folder_template.value || "{author}/{title}";
     const row = (label, book) => `<div><span>${label}</span>${esc(dir)}/<b>${esc(layoutFolders(template, book).join("/"))}</b></div>`;
     const usesSeries = /\{(series|series_number|year)\}/.test(template);
-    $("#path-preview", root).innerHTML = usesSeries
+    $("#path-preview", root).innerHTML = template.includes("{kind}")
+      ? row("Audiobook", LAYOUT_SAMPLE) + row("Ebook", { ...LAYOUT_SAMPLE, kind: "Ebooks" })
+      : usesSeries
       ? row("In a series", LAYOUT_SAMPLE) + row("On its own", LAYOUT_SAMPLE_SOLO)
       : row("", LAYOUT_SAMPLE);
   };
@@ -2801,6 +2850,7 @@ function Settings(root, page) {
   let routes = [];
   let advertised = [];
   let defaultClient = s.default_client || "";
+  let fallbackClient = s.debrid_fallback_client || "";
   let defaults = { torrent: "", usenet: "" };  // where a release no rule matches goes, per protocol
   const DELIVERY = { sabnzbd: "usenet", nzbget: "usenet" };
   const deliveryOf = (c) => DELIVERY[c.type] || "torrent";
@@ -2815,6 +2865,7 @@ function Settings(root, page) {
     hidden("clients", JSON.stringify(clients));
     hidden("client_routes", JSON.stringify({ version: 1, rules: routes }));
     hidden("default_client", defaultClient);
+    hidden("debrid_fallback_client", fallbackClient);
     dirty();
   };
   const clientName = (c) => esc(TYPE_LABEL[c.type] || c.type) + (c.id === c.type ? "" : ` · ${esc(c.id)}`);
@@ -2855,7 +2906,21 @@ function Settings(root, page) {
 
   const drawClients = () => {
     const firstOfType = new Set();
-    clientBox.innerHTML = clients.length ? clients.map((c, i) => {
+    // Only a local torrent client is a valid fallback: the point is to download and seed
+    // on the user's own machine when a cloud service doesn't have the release cached.
+    const localTorrent = clients.filter((c) => deliveryOf(c) === "torrent" && !DEBRID.includes(c.type));
+    if (fallbackClient && !localTorrent.some((c) => c.id === fallbackClient)) fallbackClient = "";
+    const fallbackHTML = localTorrent.length ? `
+      <div class="field" style="margin-top:14px">
+        <label>When your cloud service hasn't cached a torrent</label>
+        <select class="input" data-fallback>
+          <option value="">Off — send it to the cloud service anyway</option>
+          ${localTorrent.map((c) => `<option value="${esc(c.id)}" ${c.id === fallbackClient ? "selected" : ""}>Send it to ${clientName(c)} instead, so it downloads and seeds</option>`).join("")}
+        </select>
+        <span class="hint">Only when the service says it definitely doesn't have it. If it can't answer, or the service has no cache check, the release still goes to the cloud service.</span>
+      </div>` : "";
+
+    clientBox.innerHTML = (clients.length ? clients.map((c, i) => {
       const fields = FIELDS[c.type] || [];
       const own = fields.filter(([k]) => ["url", "username", "password", "api_key"].includes(k));
       const extra = fields.filter(([k]) => ["category", "save_path"].includes(k));
@@ -2882,7 +2947,7 @@ function Settings(root, page) {
         ${del ? `<label class="switch"><input type="checkbox" name="${del[0]}" ${deleteAfter[del[0]] ? "checked" : ""}><i></i>${del[1]}</label>` : ""}
         <div data-out></div>
       </div>`;
-    }).join("") : `<p class="muted client-empty">No download client yet. Add the one you already use.</p>`;
+    }).join("") : `<p class="muted client-empty">No download client yet. Add the one you already use.</p>`) + fallbackHTML;
   };
   // Until the server says otherwise, a protocol's default is its first client.
   const fillDefaults = () => {
@@ -3130,6 +3195,7 @@ function Settings(root, page) {
       const [c, cov] = await Promise.all([api("/api/download-clients"), api("/api/routing/coverage")]);
       adoptClients(c.clients);
       defaultClient = c.default_client || "";
+      fallbackClient = c.debrid_fallback_client || "";
       defaults = { torrent: "", usenet: "", ...(c.defaults || {}) };
       advertised = cov.indexers || [];
       routes = (cov.rules || []).map((r) => ({ match: { indexers: r.match.indexers || [], categories: r.match.categories || [] },
@@ -3263,6 +3329,7 @@ function Settings(root, page) {
     // The list comes back with its secrets masked, so a typed password doesn't stay in the page.
     adoptClients(state.settings.clients);
     defaultClient = state.settings.default_client || "";
+    fallbackClient = state.settings.debrid_fallback_client || "";
     try { defaults = { torrent: "", usenet: "", ...((await api("/api/download-clients")).defaults || {}) }; } catch { fillDefaults(); }
     drawClients(); drawRoutes(); sync();
     state.sources = await api("/api/sources"); // the Prowlarr tab appears once it's set up
@@ -3298,17 +3365,18 @@ function Settings(root, page) {
   $("#tidy-fill", root).onclick = async (e) => {
     const btn = e.currentTarget, note = $("#tidy-fill-note", root);
     spinBtn(btn, true);
-    let checked = 0, filled = 0;
+    let checked = 0, filled = 0, fromAbs = 0;
     try {
       for (;;) {
         const r = await api("/api/tidy/fill-details", { method: "POST", body: { batch: 12 } });
-        checked += r.checked; filled += r.filled;
-        note.textContent = r.remaining ? `Asked Audible about ${checked} books, filled in ${filled}. ${r.remaining} to go…` : "";
+        checked += r.checked; filled += r.filled; fromAbs += r.from_audiobookshelf || 0;
+        note.textContent = r.remaining ? `Looked up ${checked} books, filled in ${filled}. ${r.remaining} to go…` : "";
         if (!r.remaining || !root.isConnected) break;
       }
+      const absNote = fromAbs ? ` ${fromAbs} of them came from your Audiobookshelf library.` : "";
       note.innerHTML = checked
-        ? `Asked Audible about ${checked} book${checked === 1 ? "" : "s"} and filled in details for ${filled}. Press <b>Preview changes</b> to see the new folder names.`
-        : "Every book already has its series, narrator and year, or Audible has been asked about it before.";
+        ? `Looked up ${checked} book${checked === 1 ? "" : "s"} and filled in details for ${filled}.${absNote} Press <b>Preview changes</b> to see the new folder names.`
+        : "Every book already has its series, narrator and year, or has been looked up before.";
       await refreshLibrary();
     } catch (err) {
       toast(err.message, { kind: "err" });
@@ -3333,6 +3401,12 @@ function Settings(root, page) {
   tidyUndoState();
   form.addEventListener("input", dirty);
   form.addEventListener("change", dirty);
+  clientBox.addEventListener("change", (e) => {
+    const pick = e.target.closest("[data-fallback]");
+    if (!pick) return;
+    fallbackClient = pick.value;
+    sync();
+  });
   $("#discard", root).onclick = () => { state.view = Settings(root, page); };
   $$(".stepper [data-step]", form).forEach((b) => {
     b.onclick = () => {
@@ -3719,6 +3793,10 @@ function Settings(root, page) {
       const known = r.libraries.some((l) => l.id === r.library_id);
       sel.innerHTML = (known ? "" : `<option value="">Choose a library</option>`)
         + r.libraries.map((l) => `<option value="${esc(l.id)}" ${l.id === r.library_id ? "selected" : ""}>${esc(l.name)}</option>`).join("");
+      const ebookId = r.ebook_library_id || "";
+      form.audiobookshelf_ebook_library_id.innerHTML = `<option value="">The same library</option>`
+        + r.libraries.filter((l) => l.id !== r.library_id)
+          .map((l) => `<option value="${esc(l.id)}" ${l.id === ebookId ? "selected" : ""}>${esc(l.name)}</option>`).join("");
     } catch (err) {
       $("#audiobookshelf-result", root).innerHTML = badLine(err.message);
     }
@@ -3799,6 +3877,9 @@ function Settings(root, page) {
 
   form.audiobookshelf_library_id.onchange = async () => {
     $("#audiobookshelf-result", root).innerHTML = "";
+    try { await save(true); absShow(); } catch (err) { toast(err.message, { kind: "err" }); }
+  };
+  form.audiobookshelf_ebook_library_id.onchange = async () => {
     try { await save(true); } catch (err) { toast(err.message, { kind: "err" }); }
   };
   $("#abs-check", root).onclick = async (e) => {
@@ -3822,7 +3903,7 @@ function Settings(root, page) {
   tester("audiobookshelf", (r) => `Connected to Audiobookshelf ${esc(r.version)} · rescans <b>${esc(r.library)}</b> after each download`);
   $("#abs-disconnect", root).onclick = async (e) => {
     e.preventDefault();
-    state.settings = await api("/api/settings", { method: "PUT", body: { audiobookshelf_token: "", audiobookshelf_library_id: "" } });
+    state.settings = await api("/api/settings", { method: "PUT", body: { audiobookshelf_token: "", audiobookshelf_library_id: "", audiobookshelf_ebook_library_id: "" } });
     form.audiobookshelf_token.value = "";
     $("#audiobookshelf-result", root).innerHTML = "";
     $("#abs-check-result", root).hidden = true;
@@ -3832,6 +3913,104 @@ function Settings(root, page) {
     toast("Disconnected. Narratarr’s key is still listed in Audiobookshelf, where you can revoke it.");
   };
   absShow();
+
+  // ---- Hardcover (see narratarr/hardcover.py): connect with a code, then the shelf comes to Wanted ----
+  const HC_OUTCOME = { added: ["Added to Wanted", "ok"], in_library: ["Already in your library", ""], not_found: ["Not found on Audible", "warn"] };
+  let hcWaiting = 0;  // which sign-in the polling belongs to, so Cancel or a new one stops the old loop
+  const hcShow = async () => {
+    let r;
+    try { r = await api("/api/hardcover"); } catch { return; }
+    if (!root.isConnected) return;
+    $("#hc-panel", root).hidden = !r.available;
+    if (!r.available) return;
+    $("#hc-head", root).hidden = !r.connected;
+    $("#hc-intro", root).hidden = r.connected;
+    $("#hc-connect", root).hidden = r.connected;
+    $("#hc-on", root).hidden = !r.connected;
+    $("#hc-user", root).textContent = r.user || "your account";
+    const last = r.last_sync || {};
+    $("#hc-last", root).innerHTML = last.error ? `<span class="bad-text">${esc(last.error)}</span>`
+      : last.at ? `Looked ${esc(ago(last.at))}: ${last.added || 0} added${last.not_found ? `, ${last.not_found} not found on Audible` : ""}${last.more ? ", more next time" : ""}.`
+      : "It looks a few minutes after Narratarr starts, then every six hours.";
+    $("#hc-recent", root).innerHTML = (r.recent || []).map((b) => {
+      const [label, tone] = HC_OUTCOME[b.outcome] || [b.outcome, ""];
+      return `<li><span><b>${esc(b.title || "Untitled")}</b><small>${esc(b.author || "")}</small></span><em class="${tone}">${esc(label)}</em></li>`;
+    }).join("");
+    $("#hc-retry", root).hidden = !(r.recent || []).some((b) => b.outcome === "not_found");
+  };
+  $("#hc-retry", root).onclick = async (e) => {
+    const btn = e.currentTarget;
+    spinBtn(btn, true);
+    try {
+      await api("/api/hardcover/retry", { method: "POST" });
+      const r = await api("/api/hardcover/sync", { method: "POST" });
+      toast(r.added ? `Found ${r.added} more on Audible` : "Audible still doesn’t have them. Narratarr looks again each month.", { kind: "ok" });
+      refreshLibrary();
+    } catch (err) {
+      toast(err.message, { kind: "err" });
+    }
+    spinBtn(btn, false);
+    hcShow();
+  };
+  const hcWait = async (mine, every) => {
+    while (mine === hcWaiting && root.isConnected) {
+      await new Promise((ok) => setTimeout(ok, every * 1000));
+      if (mine !== hcWaiting || !root.isConnected) return;
+      let r;
+      try { r = await api("/api/hardcover/poll", { method: "POST" }); } catch { continue; }
+      if (r.state === "pending") continue;
+      hcWaiting++;
+      $("#hc-start", root).hidden = false;
+      $("#hc-code", root).innerHTML = r.state === "connected" ? ""
+        : badLine(r.state === "denied" ? "Access wasn't approved on Hardcover." : "The code ran out before it was approved. Connect again for a new one.");
+      if (r.state === "connected") {
+        toast(`Connected to Hardcover${r.user ? ` as ${r.user}` : ""}`, { kind: "ok" });
+        state.settings = await api("/api/settings");
+      }
+      return hcShow();
+    }
+  };
+  $("#hc-start", root).onclick = async (e) => {
+    const btn = e.currentTarget;
+    spinBtn(btn, true);
+    try {
+      const r = await api("/api/hardcover/connect", { method: "POST" });
+      const mine = ++hcWaiting;
+      $("#hc-code", root).innerHTML = `<div class="hc-code">
+          <span>Your code</span><b>${esc(r.user_code)}</b>
+          <a class="btn primary" href="${esc(r.verification_uri_complete)}" target="_blank" rel="noopener noreferrer">Open Hardcover</a>
+          <small><span class="spinner"></span> Waiting for you to approve it. Or go to <code>${esc(r.verification_uri)}</code> and type the code in.</small>
+          <button class="btn ghost sm" type="button" data-hc-cancel>Cancel</button>
+        </div>`;
+      btn.hidden = true;  // one sign-in at a time; Cancel or the end of this one brings it back
+      $("[data-hc-cancel]", root).onclick = () => { hcWaiting++; $("#hc-code", root).innerHTML = ""; btn.hidden = false; };
+      hcWait(mine, Math.max(3, r.interval || 5));
+    } catch (err) {
+      $("#hc-code", root).innerHTML = badLine(err.message);
+    }
+    spinBtn(btn, false);
+  };
+  $("#hc-sync", root).onclick = async (e) => {
+    const btn = e.currentTarget;
+    spinBtn(btn, true);
+    try {
+      const r = await api("/api/hardcover/sync", { method: "POST" });
+      toast(r.added ? `Added ${r.added} book${r.added === 1 ? "" : "s"} from Hardcover to Wanted` : "Nothing new on your shelf", { kind: "ok" });
+      refreshLibrary();
+    } catch (err) {
+      toast(err.message, { kind: "err" });
+    }
+    spinBtn(btn, false);
+    hcShow();
+  };
+  $("#hc-disconnect", root).onclick = async () => {
+    const ok = await modal({ title: "Disconnect Hardcover?", body: "Narratarr stops looking at your shelf and is signed out on Hardcover. Books it already added stay in Wanted.", confirm: "Disconnect" });
+    if (!ok) return;
+    try { await api("/api/hardcover/disconnect", { method: "POST" }); } catch (err) { toast(err.message, { kind: "err" }); }
+    hcWaiting++;
+    hcShow();
+  };
+  hcShow();
   $$("[data-guide]", root).forEach((el) => {
     el.onclick = (e) => {
       e.preventDefault();
@@ -4100,6 +4279,7 @@ function libraryLiveHTML(lib) {
       <div class="cta" style="margin-top:14px">
         ${local ? "" : `<button class="btn sm ghost" data-act="download">${I.retry} Download again</button>`}
         <button class="btn sm ghost" data-act="edit">${I.pencil} Edit details</button>
+        ${isAdmin() ? `<button class="btn sm ghost" data-act="tidy">${I.folder} Tidy this book</button>` : ""}
         <button class="btn sm ghost danger" data-act="remove">${I.trash} Remove</button>
       </div>`;
   }
@@ -4118,6 +4298,7 @@ function libraryLiveHTML(lib) {
       <div class="cta" style="margin-top:14px">
         ${local ? "" : `<button class="btn sm ghost" data-act="download">${I.retry} Download again</button>`}
         <button class="btn sm ghost" data-act="edit">${I.pencil} Edit details</button>
+        ${isAdmin() ? `<button class="btn sm ghost" data-act="tidy">${I.folder} Tidy this book</button>` : ""}
         <button class="btn sm ghost danger" data-act="remove">${I.trash} Remove</button>
       </div>`;
   }
@@ -4211,7 +4392,7 @@ function editDetails(lib) {
         <div class="field me-num"><label for="me-number">Book</label><input class="input" id="me-number" name="series_number" inputmode="decimal" value="${esc(ser.sequence || "")}" placeholder="1" /></div>
         <div class="field me-num"><label for="me-year">Year</label><input class="input" id="me-year" name="year" inputmode="numeric" maxlength="4" value="${esc((lib.released || "").slice(0, 4))}" placeholder="1965" /></div>
       </div>
-      <p class="hint">This changes what Narratarr shows, how it matches authors you follow, and the folder name Tidy library gives the book. Your files and folders stay as they are until you tidy.</p>
+      <p class="hint">This changes what Narratarr shows, how it matches authors you follow, and the folder name Tidy gives the book. Your files and folders stay as they are until you press <b>Tidy this book</b>.</p>
       <div class="cta"><button class="btn primary" type="submit">Save</button><button class="btn" type="button" data-audible>${I.search} Fill in from Audible</button><button class="btn ghost" type="button" data-cancel>Cancel</button></div>
     </form>`;
   const form = $("#meta-edit", head);
@@ -4260,6 +4441,35 @@ function editDetails(lib) {
       spinBtn(btn, false);
     }
   };
+}
+
+// ---- tidying one book ----
+
+// The same move as Tidy library, for one book: shows where it goes (or why it can't), and asks first.
+async function tidyOne(lib, btn) {
+  if (!lib) return;
+  spinBtn(btn, true);
+  try {
+    const r = await api(`/api/tidy/book/${lib.id}`);
+    if (r.state === "tidy") { toast("This book is already where your folder layout puts it.", { kind: "ok" }); return; }
+    if (r.state !== "move") { toast(r.reason || "Tidy can't move this book yet.", { kind: "err" }); return; }
+    const carries = r.carries.length ? `<p class="tidy-one-note">Its ebook ${r.carries.map((t) => `“${esc(t)}”`).join(", ")} moves with it.</p>` : "";
+    const ok = await modal({
+      title: "Tidy this book?",
+      body: "It moves into the folder your layout gives it. Nothing else in your library changes, and Undo in Settings → General puts it back.",
+      confirm: "Move it",
+      extra: `<div class="tidy-one"><span>From</span><code>${esc(r.from)}</code><span>To</span><code>${esc(r.to)}</code></div>${carries}`,
+    });
+    if (!ok) return;
+    await api(`/api/tidy/book/${lib.id}`, { method: "POST" });
+    await refreshLibrary();
+    toast("Moved into your folder layout", { kind: "ok" });
+    openDrawer({ bookId: lib.id });
+  } catch (err) {
+    toast(err.message, { kind: "err" });
+  } finally {
+    spinBtn(btn, false);
+  }
 }
 
 // ---- following from the drawer ----
@@ -4474,6 +4684,7 @@ drawer.onclick = async (e) => {
   const act = btn.dataset.act;
   if (act === "releases") return showReleases(drawerBook());
   if (act === "edit") return editDetails(drawerBook());
+  if (act === "tidy") return tidyOne(drawerBook(), btn);
   spinBtn(btn, true);
   try {
     if (act === "add" || act === "want") {

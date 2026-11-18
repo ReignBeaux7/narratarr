@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import logging
 import socket
 from urllib.parse import urlparse
@@ -399,34 +400,58 @@ class Audiobookshelf:
 
 
 def _book_of(item: dict) -> dict:
-    """The title, author and ASIN Audiobookshelf has for a library item."""
+    """What Audiobookshelf knows about a library item: title, author and ASIN for matching, and the
+    narrators, series and release date Fill in missing details can take from it."""
     meta = ((item.get("media") or {}).get("metadata") or {}) if isinstance(item.get("media"), dict) else {}
+    narrators = [n.strip()[:120] for n in str(meta.get("narratorName") or "").split(",") if n.strip()][:4]
+    date = str(meta.get("publishedDate") or "")
+    year = str(meta.get("publishedYear") or "")
+    released = date[:10] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date[:10]) else (year if re.fullmatch(r"\d{4}", year) else "")
     return {"title": str(meta.get("title") or ""), "author": str(meta.get("authorName") or ""),
-            "asin": str(meta.get("asin") or "")}
+            "asin": str(meta.get("asin") or ""), "narrators": narrators,
+            "series": _first_series(str(meta.get("seriesName") or "")), "released": released}
+
+
+def _first_series(text: str) -> list[dict]:
+    """The first series in Audiobookshelf's one-line seriesName ("Dune Chronicles #1, Other #2").
+    A name with a comma and no number can't be told apart from two series, so it's left alone."""
+    text = text.strip()
+    numbered = re.match(r"(.+?) #(\d+(?:\.\d+)?)(?:, |$)", text)
+    if numbered:
+        return [{"asin": "", "title": numbered.group(1).strip()[:200], "sequence": numbered.group(2)}]
+    if text and ", " not in text and "#" not in text:
+        return [{"asin": "", "title": text[:200], "sequence": ""}]
+    return []
 
 
 OWNED_SECONDS = 600
-_owned: dict = {"key": None, "at": 0.0, "books": []}
+_owned: dict = {}  # (url, library id) -> {"at": time, "books": [...]}
+KIND_FOLDERS = ("Audiobooks", "Ebooks")  # what {kind} names a folder (layout.KIND_FOLDERS)
 
 
-async def owned(settings) -> list[dict]:
-    """The books in the connected Audiobookshelf library, as {title, author, asin}. Kept for ten minutes,
-    so pages that check it stay quick. Nothing, rather than an error, when it can't be reached."""
+async def owned(settings, library: str | None = None) -> list[dict]:
+    """The books in the connected Audiobookshelf library (or another one, by id), as {title, author, asin,
+    ...}. Kept for ten minutes, so pages that check it stay quick. Nothing, rather than an error, when it
+    can't be reached."""
     import time
 
-    url, token, library = settings.audiobookshelf_url, settings.audiobookshelf_token, settings.audiobookshelf_library_id
+    url, token = settings.audiobookshelf_url, settings.audiobookshelf_token
+    library = library or settings.audiobookshelf_library_id
     if not (url and token and library):
         return []
     key = (url, library)
-    if _owned["key"] == key and time.time() - _owned["at"] < OWNED_SECONDS:
-        return _owned["books"]
+    cached = _owned.get(key)
+    if cached and time.time() - cached["at"] < OWNED_SECONDS:
+        return cached["books"]
     try:
         async with Audiobookshelf(url, token) as server:
             books = [i for i in await server.items(library) if not i["missing"] and i["title"]]
     except AudiobookshelfError as e:
         log.info("Couldn't read the Audiobookshelf library: %s", e)
-        return _owned["books"] if _owned["key"] == key else []
-    _owned.update(key=key, at=time.time(), books=books)
+        return cached["books"] if cached else []
+    for old in [k for k in _owned if k[0] != url]:
+        del _owned[old]  # a different server now: forget the old one's books
+    _owned[key] = {"at": time.time(), "books": books}
     return books
 
 
@@ -452,6 +477,10 @@ def compare(books: list[dict], library_dir: str, items: list[dict]) -> dict:
     for path, title in folders.items():
         rel = path[len(root):] if path[:len(root)] == root and len(path) > len(root) else path[-2:]
         hit = next((full for full, r in there if len(r) >= len(rel) and r[-len(rel):] == rel), None)
+        if hit is None and len(rel) > 2 and rel[0] in KIND_FOLDERS:
+            # Filed apart with {kind}: the library watches Audiobooks/ or Ebooks/, so its paths start below it.
+            rel = rel[1:]
+            hit = next((full for full, r in there if len(r) >= len(rel) and r[-len(rel):] == rel), None)
         if hit is None:
             missing.append(title)
             continue

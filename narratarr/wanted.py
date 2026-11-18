@@ -15,6 +15,7 @@ import logging
 import re
 import time
 from datetime import date
+from pathlib import Path
 from urllib.parse import urlencode
 
 from rapidfuzz import fuzz
@@ -328,6 +329,60 @@ def details_due(book: dict) -> bool:
                            and series_first(book.get("title") or "") is not None)
 
 
+def _parts(path: str) -> tuple[str, ...]:
+    return tuple(x for x in str(path).replace("\\", "/").split("/") if x)
+
+
+def abs_match(book: dict, items: list[dict], library_dir: str) -> dict | None:
+    """The Audiobookshelf item for a library book: the one at the same place in the library folder
+    (paths differ across Docker mounts, so it's the part under the library that has to agree), else
+    the same ASIN, else the same title and author."""
+    if book.get("path"):
+        folder = _parts(book["path"])
+        if kind_of(book) == "ebook":
+            folder = folder[:-1]
+        root = _parts(str(Path(library_dir).expanduser()))
+        inside = folder[:len(root)] == root and len(folder) > len(root)
+        rel = folder[len(root):] if inside else folder
+        for item in items:
+            theirs = _parts(item.get("rel") or "")
+            # Inside the library the whole relative path must agree (less a leading Audiobooks/ or Ebooks/
+            # from {kind}, when Audiobookshelf watches that folder); outside it, at least author/title.
+            if inside:
+                hit = theirs and (theirs == rel or (len(rel) > 2 and rel[0] in ("Audiobooks", "Ebooks")
+                                                   and theirs == rel[1:]))
+            else:
+                hit = len(theirs) >= 2 and rel[-len(theirs):] == theirs
+            if hit:
+                return item
+    if book.get("asin"):
+        hit = next((i for i in items if i.get("asin") == book["asin"]), None)
+        if hit:
+            return hit
+    return next((i for i in items if i.get("title") and _titles_match(i["title"], i.get("author", ""),
+                                                                  book["title"], book["author"])), None)
+
+
+def fill_from_audiobookshelf(book: dict, items: list[dict], library_dir: str) -> list[str]:
+    """Fill what the book is missing (series, narrators, year, ASIN) from the user's own Audiobookshelf
+    library, which often already has it right. Only empty details are filled. Returns what changed."""
+    match = abs_match(book, items, library_dir)
+    if not match:
+        return []
+    changes: dict = {}
+    if not book.get("series") and match.get("series"):
+        changes["series"] = match["series"][:1]
+    if not book.get("narrators") and match.get("narrators"):
+        changes["narrators"] = match["narrators"][:4]
+    if not book.get("released") and match.get("released"):
+        changes["released"] = match["released"]
+    if not book.get("asin") and re.fullmatch(r"[A-Z0-9]{10}", match.get("asin") or ""):
+        changes["asin"] = match["asin"]
+    if changes:
+        db.update(book["id"], **changes)
+    return list(changes)
+
+
 async def fill_from_audible(book: dict) -> list[str]:
     """Fill only what the book is missing (series, narrators, year, ASIN) from Audible. Returns what changed.
     The one thing it rewrites is a title that leads with its series, once the series fields hold it."""
@@ -459,6 +514,61 @@ def add_wanted(b: dict, kind: str = "audiobook", source: str = "audible", status
         # Audible's runtime is the audiobook's; Open Library's page count is the book's.
         "length": b.get("length") or "" if audio == (source == "audible") else "",
     })
+
+
+HARDCOVER_PER_SYNC = 25  # new shelf books matched per check, so a big first check goes easy on Audible
+HARDCOVER_RETRY_DAYS = 30  # a shelf book Audible didn't have is looked up again after this long
+
+
+async def _hardcover_match(item: dict) -> dict | None:
+    """Audible's book for a shelf book. An audio edition's ASIN first, but only if Audible's book has the same
+    title and author (Hardcover's data is community-edited, and an ASIN can be another store's or a Kindle
+    one); then the exact title and author, the way Fill in missing details matches."""
+    if not (item["title"] and item["author"]):
+        return None
+    if item["asin"]:
+        hit = await audible_match({"title": item["title"], "author": item["author"], "asin": item["asin"]})
+        if hit and _titles_match(hit.get("title") or "", hit.get("author") or "", item["title"], item["author"]):
+            return hit
+    return await audible_match({"title": item["title"], "author": item["author"], "asin": ""})
+
+
+async def sync_hardcover(transport=None, most: int = HARDCOVER_PER_SYNC) -> dict:
+    """Books on the connected Hardcover account's Want to Read shelf come to Wanted.
+
+    Each new shelf book is matched on Audible and added in the format chosen in Settings. Each is handled
+    once: a book you take off Wanted stays off, and a book Audible doesn't have is listed as not found.
+    One check at a time; a second one asked for meanwhile is told so (hardcover.Busy)."""
+    from . import hardcover
+
+    lock = hardcover._lock("sync")
+    if lock.locked():
+        raise hardcover.Busy("Narratarr is already checking your Hardcover shelf.")
+    async with lock:
+        # Audible adds books all the time: one it didn't have gets another look after a month.
+        db.hardcover_forget("not_found", older_than=time.time() - HARDCOVER_RETRY_DAYS * 86400)
+        new, more = await hardcover.want_to_read(transport, skip=db.hardcover_seen_ids(), enough=most)
+        fmt = config.load().hardcover_format
+        kinds = ("audiobook", "ebook") if fmt == "both" else (fmt if fmt in ("audiobook", "ebook") else "audiobook",)
+        counts = {"added": 0, "in_library": 0, "not_found": 0}
+        added_ids: list[int] = []
+        for item in new:
+            match = await _hardcover_match(item)
+            outcome, book_id = "not_found", None
+            if match and match.get("url"):
+                outcome = "in_library"
+                for kind in kinds:
+                    row = add_wanted(match, kind, "audible", "wanted")
+                    if row:
+                        outcome = "added"
+                        added_ids.append(row["id"])
+                        book_id = book_id or row["id"]
+                    else:
+                        have = in_library(match.get("asin") or "", match["title"], match["author"], kind=kind)
+                        book_id = book_id or (have or {}).get("id")
+            db.hardcover_record(item["id"], item["title"], item["author"], outcome, book_id)
+            counts[outcome] += 1
+        return {**counts, "checked": len(new), "more": more, "added_ids": added_ids}
 
 
 def want_other_format(book: dict, status: str = "wanted") -> tuple[dict, bool]:

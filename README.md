@@ -288,6 +288,23 @@ Press **Test** next to each one. Once Prowlarr is connected, a **Prowlarr** tab 
 - **qBittorrent / Transmission / Deluge:** when the torrent finishes, Narratarr **hard-links** the files into your library (copying only if they're on different drives). The torrent keeps seeding, which matters on private trackers.
 - **Stop or Remove** in Narratarr also removes an unfinished download from the client.
 
+**When your cloud service hasn't got the torrent yet.** Real-Debrid, AllDebrid, TorBox and Premiumize download the torrent themselves, which is what makes them fast. If the release is not already on their servers they have to fetch it first, and some of them charge that against a tight budget: TorBox allows only 60 uncached adds an hour, against 300 a minute when it already has the file.
+
+If you also run qBittorrent, Transmission or Deluge, you can tell Narratarr to send uncached torrents there instead. It appears under **Settings → Downloads** as *When your cloud service hasn't cached a torrent*. Pick a local client and the release downloads from the swarm on your own machine, seeds for other people, and only then is it linked into your library. Leave it on **Off** and nothing changes. The torrent is never removed from the local client afterwards, so it keeps seeding.
+
+The fallback only fires on a definite "not cached" answer:
+
+| What the service says | What Narratarr does |
+| --- | --- |
+| It has the torrent | Sends it there as usual |
+| It definitely hasn't got it | Sends it to your local client, and says so on the book |
+| It can't answer (an error, a timeout, an unclear reply) | Sends it there as usual, and says why it didn't fall back |
+| It has no cache check Narratarr trusts | Sends it there as usual, and says so |
+
+That last pair matters: a provider having a bad minute will never quietly send your download somewhere you didn't pick. **TorBox** has a documented cache check that Narratarr uses. **Real-Debrid** still documents one but several other tools report it was switched off, so Narratarr only trusts a positive answer from it and treats everything else as unknown; it has not been verified against a live Real-Debrid account. **AllDebrid** and **Premiumize** are not wired up, so uncached fallback does not apply to them.
+
+Two smaller limits, stated rather than hidden: a `.torrent` file whose hash Narratarr doesn't already know cannot be checked (there is no bencode parser in the app), and a cloud service that removes the torrent after downloading it does not help the swarm, which is the other half of why the local route exists.
+
 Narratarr searches category `3030` (*Audio › Audiobook*) for audiobooks and `7020` (*Books › EBook*) for ebooks by default; you can change either under **Settings → Prowlarr**. The Prowlarr tab on Discover has an **Audiobooks / Ebooks** switch, and **Test** tells you which of your indexers offer ebooks. To go easy on indexer API limits, each search is sent once as typed, and a second, spelling-corrected search is only made when the first finds little.
 
 > [!TIP]
@@ -346,6 +363,7 @@ Some books aren't out yet, or aren't on your indexers yet. Put them on your **Wa
 - **Pick a release yourself:** open a Wanted book and press **Pick a release** to see every match with a score, then **Grab** the one you want. The book keeps Audible's title, cover and description whichever release you pick.
 - **Audiobook, ebook or both:** when you add a book to Wanted, choose the format. You can also open any book in your library and press **Want it too** on the format you don't have yet. Ebooks are searched for in your indexers' ebook categories, and Narratarr keeps one file per book, preferring EPUB, then AZW3, MOBI and PDF. The ebook goes into the audiobook's folder (or the audiobook into the ebook's), which is how Audiobookshelf shows both as one book. A finished EPUB opens in Narratarr's own reader (pages you turn, Paper, Sepia and Night themes, text size and font, contents, and your place remembered), a PDF in your browser's viewer, and any ebook can be downloaded for Apple Books, Kindle, Kobo or another reading app.
 - **Follow authors and series:** on the **Authors** page, search for an author and press **Follow**, or press **Follow** on any book's author or series. Their new releases (and, if you like, everything already out) go straight to Wanted. Each author and series page shows their books, what's in your library, and an **Add all missing** button.
+- **Your Hardcover shelf:** connect [Hardcover](https://hardcover.app) under **Settings → Search & sources → Hardcover**, and books you mark **Want to Read** there come to Wanted. Connecting takes a short code you approve on hardcover.app, so you never paste a password or key into Narratarr. It can only read your profile and shelves, and never changes anything on Hardcover. Every six hours (or when you press **Check now**), new shelf books are matched on Audible: by an audio edition's ASIN when Hardcover has one, otherwise by exact title and author. Each is added in the format you pick (audiobook, ebook or both), up to 25 per check. Each book is handled once, so one you take off Wanted stays off, and the panel lists what happened to each, including books Audible doesn't have. Those get another look each month, or right away with **Look again**. **Disconnect** signs Narratarr out on Hardcover as well. Hardcover's API is still in beta, so this may need fixes as it changes.
 
 ### Importing books you already have
 
@@ -388,6 +406,7 @@ A few things are set with environment variables instead:
 | `{series}` | The series name | `Dune Chronicles` |
 | `{series_number}` | The book's number in its series | `1`, `2.5` |
 | `{year}` | The year it came out | `1965` |
+| `{kind}` | `Audiobooks` or `Ebooks` | `Ebooks` |
 
 When a book doesn't have one of these, that part is left out along with the words and punctuation around it, so one layout works for every book:
 
@@ -398,6 +417,8 @@ When a book doesn't have one of these, that part is left out along with the word
 | `{author}/{title} ({year})` | `Frank Herbert/Dune (1965)` | `Andy Weir/Project Hail Mary (2021)` |
 
 Settings has one-click presets for these, including an **Audiobookshelf style** one, `{author}/{series}/Vol {series_number} - {year} - {title} {{narrator}}`, which gives `Frank Herbert/Dune Chronicles/Vol 1 - 1965 - Dune {Scott Brick}`: Audiobookshelf reads the series, volume, year and narrator straight from that name. (Double braces keep a brace in the name; an empty narrator leaves the braces out too.) The second layout above is how Audiobookshelf likes series laid out. Series and year come from the Audible catalog for Wanted books, and from the file's tags (`SERIES`, `SERIES-PART`, the date) for imports. Settings shows a live preview as you type. Changing the layout applies to books downloaded from then on. To move the books already in your library, use Tidy library.
+
+**Audiobooks and ebooks in separate Audiobookshelf libraries.** Normally an ebook goes into its audiobook's folder, which is how Audiobookshelf shows both formats as one book. If you'd rather have an ebook library of their own, start the layout with `{kind}` (the **Audiobooks and ebooks apart** preset is `{kind}/{author}/{title}`). Audiobooks then go under `Audiobooks/` and ebooks under `Ebooks/`, both inside your library folder. In Audiobookshelf, point one library at each folder, and under **Settings → Audiobookshelf → Library for ebooks** pick the ebook one, so it's rescanned after an ebook download. Tidy library moves existing books to match: an ebook that sits in its audiobook's folder moves out first, and the audiobook moves on the next run.
 
 ### Tidy library
 
@@ -410,7 +431,9 @@ Settings has one-click presets for these, including an **Audiobookshelf style** 
 
 Audiobookshelf rescans once when tidying finishes, if it's connected.
 
-Books whose tags don't say their series, narrator or year are filed as singles. **Fill in missing details** (next to **Preview changes**) asks Audible for them, only for books whose title and author match exactly, and never overwrites what a book already has. A name that leads with its series, such as `Playing for Keeps #1 - Consider Me`, is matched by its title alone as long as Audible has it in that series, and then loses the prefix, since the series fields hold it. For a single book, open it and use **Edit details**: set the series, its number and the year yourself, or press **Fill in from Audible**.
+Books whose tags don't say their series, narrator or year are filed as singles. **Fill in missing details** (next to **Preview changes**) takes them from your Audiobookshelf library first, when it's connected and has the book (matched by where it sits in the library folder, then ASIN, then title and author), and asks Audible for the rest, only for books whose title and author match exactly, and never overwrites what a book already has. A name that leads with its series, such as `Playing for Keeps #1 - Consider Me`, is matched by its title alone as long as Audible has it in that series, and then loses the prefix, since the series fields hold it. For a single book, open it and use **Edit details**: set the series, its number and the year yourself, or press **Fill in from Audible**. Then press **Tidy this book** to move just that one into its folder, with the same checks and the same Undo as tidying the whole library.
+
+To have this happen by itself for new downloads, turn on **Settings → General → Fill in missing details before filing a download**. When a download finishes without a series, narrator or year, Narratarr looks it up on Audible before naming its folder. As with the button, only empty details are filled, and only from a book whose title and author match. If Audible can't be reached, the book is filed as it is.
 
 **Tidying a library Narratarr didn't download.** Tidy works on the books in Narratarr's library, so bring the others in first without moving them:
 
@@ -475,6 +498,7 @@ Narratarr has no telemetry and phones nobody. These are the only outside service
 | **Real-Debrid**, **AllDebrid**, **TorBox**, **Premiumize**, **Prowlarr**, **SABnzbd**, **NZBGet**, **qBittorrent**, **Transmission**, **Deluge**, **Torznab**, **Audiobookshelf** | Whatever each needs, with the key you entered for it | Only the ones you set up |
 | **Cover image hosts** (archive.org, Amazon's image CDN, covers.openlibrary.org, your indexers) | Nothing but the image request, with no referrer | Your browser loads cover art directly |
 | **Your notification destinations** (ntfy, Gotify, Discord, webhooks) | The book's title, author and cover link, and who asked for it | Only the ones you add under Settings → Notifications, for the events you choose |
+| **Hardcover** (api.hardcover.app) | Your sign-in approval, then requests for your account name and your Want to Read shelf | Only if you connect it: every six hours, and when you press **Check now** |
 | **GitHub** (api.github.com) | Nothing but the request for the latest release | Once a day, for the update badge. Off under Settings → Updates |
 
 Fonts are bundled, so the UI itself never contacts a CDN. Torrents downloaded through **qBittorrent, Transmission or Deluge** expose your IP address to other peers, as with any torrent client; Real-Debrid, AllDebrid, TorBox and Premiumize don't.

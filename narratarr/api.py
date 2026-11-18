@@ -30,7 +30,7 @@ from . import (apiv1, audible, audiobookshelf, auth, brave, config, db, download
                routing, search, tokens, updates, users, wanted)
 from .audiobookshelf import Audiobookshelf, AudiobookshelfError
 from .downloaders import ClientError
-from . import alldebrid, languages, notify, tidy
+from . import alldebrid, hardcover, languages, notify, tidy
 from .alldebrid import AllDebrid, AllDebridError
 from . import torbox
 from .premiumize import Premiumize, PremiumizeError
@@ -63,8 +63,28 @@ async def lifespan(app: FastAPI):
     await worker.stop()
 
 
+# A release's indexer link and tracker list stay on the server. Either can carry a private tracker's
+# passkey (a Torznab feed straight from a tracker, a magnet's announce URLs), the page never uses them,
+# and listeners see library and Discover rows too. The worker reads them from the database.
+SERVER_ONLY = frozenset({"download_url", "trackers"})
+
+
+def _scrub(value):
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items() if k not in SERVER_ONLY}
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    return value
+
+
+class ScrubbedJSON(JSONResponse):
+    def render(self, content) -> bytes:
+        return super().render(_scrub(content))
+
+
 # The internal API is the web UI's and changes freely, so it isn't published; apps use /api/v1.
-app = FastAPI(title="Narratarr", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Narratarr", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None,
+              default_response_class=ScrubbedJSON)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 app.mount("/api/v1", apiv1.v1)
 
@@ -1055,17 +1075,63 @@ class FillDetails(BaseModel):
 
 @app.post("/api/tidy/fill-details")
 async def tidy_fill_details(body: FillDetails):
-    """Ask Audible for the series, narrators and year that library books are missing, a few at a time.
+    """Fill in the series, narrators and year that library books are missing, a few at a time: from the
+    connected Audiobookshelf library first, which often has them already, then from Audible.
     Call again until `remaining` is 0. Each book is asked once; only empty details are filled."""
+    settings = config.load()
     todo = [b for b in db.list_books() if wanted.details_due(b)]
-    batch, filled = todo[:max(1, min(body.batch, 25))], 0
+    batch, filled, from_abs = todo[:max(1, min(body.batch, 25))], 0, 0
+    items = []  # kept for ten minutes between batches
+    if todo:
+        items = await audiobookshelf.owned(settings)
+        if settings.audiobookshelf_ebook_library_id:
+            items = items + await audiobookshelf.owned(settings, settings.audiobookshelf_ebook_library_id)
     for b in batch:
+        changed = wanted.fill_from_audiobookshelf(b, items, settings.library_dir) if items else []
+        if changed:
+            from_abs += 1
+            b = db.get(b["id"])
+            if not wanted.missing_details(b):
+                db.update(b["id"], details_checked=time.time())
+                filled += 1
+                continue
         try:
-            if await wanted.fill_from_audible(b):
+            if await wanted.fill_from_audible(b) or changed:
                 filled += 1
         except audible.AudibleError as e:
             raise HTTPException(502, str(e))
-    return {"checked": len(batch), "filled": filled, "remaining": len(todo) - len(batch)}
+    return {"checked": len(batch), "filled": filled, "from_audiobookshelf": from_abs,
+            "remaining": len(todo) - len(batch)}
+
+
+@app.get("/api/tidy/book/{book_id}")
+async def tidy_book_preview(book_id: int):
+    """Where Tidy would move one book under the folder layout, or why it can't. Moves nothing."""
+    if not db.get(book_id):
+        raise HTTPException(404, "That book isn't in the library.")
+    found = await asyncio.to_thread(tidy.preview, config.load(), "library", _busy())
+    row = next((r for r in found["books"] if r["id"] == book_id), None)
+    if row is None:
+        raise HTTPException(409, "Only a finished book with files in the library can be tidied.")
+    return {**row, "root": found["root"]}
+
+
+@app.post("/api/tidy/book/{book_id}")
+async def tidy_book(book_id: int):
+    """Move one book into the folder layout: the same move, checks and Undo as Tidy library."""
+    if tidy.JOB.running:
+        raise HTTPException(409, "Tidying is already under way. Try again when it's done.")
+    settings = config.load()
+    tidy.JOB = job = tidy.Job(running=True, total=1)
+    try:
+        await asyncio.to_thread(tidy.apply, settings, [book_id], "library", _busy(), False, False, job)
+    finally:
+        tidy.finished(job)
+    if job.moved:
+        await _worker()._notify_audiobookshelf(settings, "all")
+    if job.failed:
+        raise HTTPException(409, job.failed[0]["error"])
+    return {"moved": job.moved, "book": db.get(book_id)}
 
 
 @app.get("/api/tidy/status")
@@ -1087,7 +1153,7 @@ async def tidy_apply(body: TidyOptions):
             await asyncio.to_thread(tidy.apply, settings, body.books[:10000], body.prefer, _busy(),
                                     body.tags, body.sidecars, job)
             if job.moved:
-                await _worker()._notify_audiobookshelf(settings)
+                await _worker()._notify_audiobookshelf(settings, "all")
         except Exception as e:  # never leave the job looking busy forever
             log.exception("Tidy library failed")
             job.failed.append({"id": None, "title": "", "error": f"Unexpected error: {e}"})
@@ -1105,7 +1171,7 @@ async def tidy_undo():
     settings = config.load()
     result = await asyncio.to_thread(tidy.undo, settings, _busy())
     if result["back"]:
-        await _worker()._notify_audiobookshelf(settings)
+        await _worker()._notify_audiobookshelf(settings, "all")
     tidy.JOB = tidy.Job(undone=result["back"], failed=[{"id": None, "title": f["path"], "error": f["error"]} for f in result["failed"]],
                         finished_at=time.time())
     return {**result, "undo": len(db.last_tidy_batch()[1])}
@@ -1271,10 +1337,74 @@ async def get_settings(request: Request):
 
 @app.put("/api/settings")
 async def put_settings(changes: dict):
+    changes = {k: v for k, v in changes.items() if k not in config.SERVER_ONLY}  # see hardcover.py
     try:
         return config.update(changes).public()
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+# ---- Hardcover: the Want to Read shelf comes to Wanted (see hardcover.py) ----
+
+
+@app.get("/api/hardcover")
+async def hardcover_status():
+    s = config.load()
+    return {"available": hardcover.available(), "connected": bool(s.hardcover_refresh_token or s.hardcover_access_token),
+            "user": s.hardcover_user, "sync": s.hardcover_sync, "format": s.hardcover_format,
+            "last_sync": hardcover.last_sync, "recent": db.hardcover_recent()}
+
+
+@app.post("/api/hardcover/connect")
+async def hardcover_connect():
+    try:
+        return await hardcover.start()
+    except hardcover.HardcoverError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/hardcover/poll")
+async def hardcover_poll():
+    return await hardcover.poll()
+
+
+@app.post("/api/hardcover/sync")
+async def hardcover_sync_now():
+    if not hardcover.available():
+        raise HTTPException(400, "This copy of Narratarr hasn't been registered with Hardcover yet.")
+    try:
+        result = await hardcover.record(wanted.sync_hardcover())
+    except hardcover.Busy as e:
+        raise HTTPException(409, str(e))
+    except Exception as e:  # noqa: BLE001 - hardcover.record has written down what went wrong
+        raise HTTPException(502, str(e) if isinstance(e, (hardcover.HardcoverError, audible.AudibleError))
+                            else "Couldn't finish checking the Hardcover shelf. Try again later.")
+    if result["added_ids"]:
+        _background(_hardcover_search())
+    return {k: v for k, v in result.items() if k != "added_ids"}
+
+
+async def _hardcover_search() -> None:
+    """New Wanted books from the shelf are searched the way the automatic search does it: a few at a time,
+    only books already out, and only with an indexer set up."""
+    try:
+        if config.load().auto_search and await wanted.auto_search():
+            _worker().poke()
+    except Exception:
+        log.exception("Searching for books from Hardcover failed")
+
+
+@app.post("/api/hardcover/retry")
+async def hardcover_retry():
+    """Look again at the shelf books Audible didn't have, on the next check."""
+    return {"forgotten": db.hardcover_forget("not_found")}
+
+
+@app.post("/api/hardcover/disconnect")
+async def hardcover_disconnect():
+    await hardcover.disconnect()  # the list of shelf books already handled stays, so reconnecting doesn't re-add them
+    hardcover.last_sync.clear()
+    return {"ok": True}
 
 
 @app.post("/api/settings/test-brave")
@@ -1336,6 +1466,7 @@ async def download_clients():
     return {
         "clients": out,
         "default_client": s.default_client,
+        "debrid_fallback_client": s.debrid_fallback_client,
         # Where a release with no matching rule goes, per protocol: what the cards show as Default.
         "defaults": {"torrent": routing.default_for(s, "torrent"), "usenet": routing.default_for(s, "usenet")},
         "types": [{"type": t, "label": downloaders.LABELS[t], "delivery": downloaders.DELIVERY[t]}
@@ -1793,7 +1924,8 @@ async def abs_libraries():
     s = config.load()
     try:
         async with Audiobookshelf(s.audiobookshelf_url, s.audiobookshelf_token) as server:
-            return {"libraries": await server.libraries(), "library_id": s.audiobookshelf_library_id}
+            return {"libraries": await server.libraries(), "library_id": s.audiobookshelf_library_id,
+                    "ebook_library_id": s.audiobookshelf_ebook_library_id}
     except AudiobookshelfError as e:
         raise HTTPException(400, str(e))
 
@@ -1854,13 +1986,25 @@ async def abs_check(body: Check):
             library = next((lib for lib in await server.libraries() if lib["id"] == s.audiobookshelf_library_id), None)
             if not library:
                 raise AudiobookshelfError("Audiobookshelf doesn't know that library any more. Pick it again.")
+            # Ebooks filed apart with {kind} live in their own library: each kind is checked against its own.
+            ebook_lib = s.audiobookshelf_ebook_library_id if s.audiobookshelf_ebook_library_id != library["id"] else ""
+            groups = ([(library["id"], [b for b in books if wanted.kind_of(b) != "ebook"]),
+                       (ebook_lib, [b for b in books if wanted.kind_of(b) == "ebook"])] if ebook_lib
+                      else [(library["id"], books)])
             if body.scan and books:
-                await server.scan(library["id"])
+                for library_id, group in groups:
+                    if group:
+                        await server.scan(library_id)
             # A scan runs in the background, so look a few times while it finds things.
             for attempt in range(6 if body.scan and books else 1):
                 if attempt:
                     await asyncio.sleep(1.5)
-                result = audiobookshelf.compare(books, library_dir, await server.items(library["id"]))
+                parts = [audiobookshelf.compare(group, library_dir, await server.items(library_id))
+                         for library_id, group in groups if group]
+                result = {"books": sum(r["books"] for r in parts), "seen": sum(r["seen"] for r in parts),
+                          "missing": [t for r in parts for t in r["missing"]][:5],
+                          "seen_at": next((r["seen_at"] for r in parts if r["seen_at"]), "")} if parts else \
+                    audiobookshelf.compare([], library_dir, [])
                 if result["seen"] == result["books"]:
                     break
     except AudiobookshelfError as e:
